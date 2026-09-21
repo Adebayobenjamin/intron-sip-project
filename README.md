@@ -87,7 +87,7 @@ instance. Ansible runs over `community.aws.aws_ssm`; a shell is
 | **1** | Infrastructure — VPC, SIP core, database, app tier | **Done** |
 | **2** | Configuration — Kamailio, RTPEngine, FreeSWITCH, Docker | **Done** |
 | **3** | Backend services — ESL controller, control-plane API | **Deployed to beta** (`v0.1.2`) |
-| **4** | Integration — carrier trunks, LiveKit | Blocked on external inputs |
+| **4** | Integration — carrier trunks, LiveKit | **Done** |
 
 ### Phase 1 — Infrastructure ✅
 
@@ -157,17 +157,17 @@ There is one app instance, so new calls fail until it is back, and calls still
 running when the grace period ends are cut off. A controller restart is a short
 outage.
 
-### Phase 4 — Integration ⬜
+### Phase 4 — Integration ✅
 
 - **Carrier trunks.** Twilio is the default trunk —
   `intron-beta.pstn.frankfurt.twilio.com`, IP-authenticated both ways. Its
-  signalling ranges are filled in at `iac/.env` but **not yet applied**, so
-  `carrier_sip_cidrs` is still empty in AWS and no calls arrive. Trunk records
-  themselves are application-layer, not Kamailio config — see
-  [docs/API.md](docs/API.md). Still needs: the apply, an Origination URI and
-  Termination IP ACL on Twilio's side (both pointing at `63.182.163.164`), and
-  one entry per client BYOT SBC as they onboard.
-- **LiveKit. Working.** We run our own LiveKit server in this VPC
+  signalling ranges are applied as `carrier_sip_cidrs` on the edge security
+  group, and Twilio's Origination URI and Termination IP ACL point at the
+  edge Elastic IP `63.182.163.164`. Trunk records are application-layer, not
+  Kamailio config — see [docs/API.md](docs/API.md). Each client's own SBC
+  (bring-your-own-trunk) is added as a trunk record, and its ranges to
+  `carrier_sip_cidrs`, as they onboard.
+- **LiveKit.** We run our own LiveKit server in this VPC
   (`stacks/livekit`), reached from Kamailio over private UDP 5060. The AI
   models stay on Intron's GPU box, where a second agent worker connects out to
   our server (`infra/bin/intron-agent-bridge.sh`). Real calls have reached the
