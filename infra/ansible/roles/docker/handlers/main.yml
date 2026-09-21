@@ -1,0 +1,13 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# live-restore in daemon.json means running containers survive this, which is
+# the whole reason it is set. Without it this handler would drop every ESL
+# socket on the box as a side effect of a config change.
+- name: restart docker
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+    daemon_reload: true

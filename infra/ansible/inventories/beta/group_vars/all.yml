@@ -1,0 +1,222 @@
+---
+env_name: beta
+aws_region: eu-central-1
+
+########################################################
+# AWS SSM connection transport
+#
+# These hosts are reachable ONLY via SSM. There is no SSH daemon exposed, no
+# port 22 rule in any security group, and `key_name = null` on every instance.
+#
+# The plugin wraps each task in an SSM SendCommand; large payloads (module
+# code, rendered templates, fetched files) ride through the S3 bucket below,
+# because SSM command parameters cap at ~100 KB and a Python module does not
+# fit.
+#
+# PREREQS ON THE OPERATOR'S LAPTOP
+#   brew install --cask session-manager-plugin
+#   cd infra/ansible && make galaxy boto-deps
+#
+# PREREQS IN AWS
+#   The bucket is created by the sip-core stack (ansible-transport.tf) and
+#   every instance role is scoped to it. The OPERATOR's own IAM identity needs
+#   the same access plus the SSM actions — `make output STACK=sip-core
+#   ENV=beta EXTRA="-raw operator_iam_policy_snippet"` prints the statements.
+#   Not needed while that identity holds AdministratorAccess, which it does.
+#
+# CREDENTIALS: the klarity_aws profile, named below rather than inherited from
+# the environment. Same reasoning as the Terraform provider — an auth model
+# that only works through the Makefile breaks the first time someone runs
+# ansible-playbook directly, and it fails by reaching for whatever AWS_PROFILE
+# happens to be set, which on a laptop with several accounts configured is how
+# a play lands on the wrong fleet.
+#
+# No MFA wrapper: the identity has no MFA device, and an explicit profile
+# overrides session credentials anyway.
+########################################################
+ansible_connection: community.aws.aws_ssm
+ansible_aws_ssm_profile: klarity_aws
+ansible_aws_ssm_region: "{{ aws_region }}"
+ansible_aws_ssm_bucket_name: intron-ansible-ssm-beta-eu-central-1
+ansible_python_interpreter: /usr/bin/python3
+
+# Default user the plugin's SendCommand runs as. Plays use `become: true` to
+# elevate for system changes.
+ansible_user: ssm-user
+
+# Per-command read timeout on the SSM session.
+#
+# The default is 60s, which is nowhere near enough for the FreeSWITCH role:
+# it builds sofia-sip, spandsp and FreeSWITCH itself from source, and the
+# FreeSWITCH compile alone runs ~20 minutes even on 4 vCPUs. Apt installs and
+# templating finish well inside a minute and are unaffected by the higher cap.
+#
+# Set `ansible_aws_ssm_timeout: <n>` as a task-level var to shorten it for
+# something that should fail fast.
+ansible_aws_ssm_timeout: 3600
+
+########################################################
+# Network topology.
+#
+# Mirrors the network stack's subnet layout — see
+# iac/stacks/network/_main/main.tf. The third octet is the tier marker:
+#   .0/.1   edge (public)    .10/.11  app    .20/.21  sip    .30/.31  data
+########################################################
+vpc_cidr: "10.70.0.0/16"
+edge_subnet_cidr: "10.70.0.0/24"
+app_subnet_cidrs:
+  - "10.70.10.0/24"
+  - "10.70.11.0/24"
+sip_subnet_cidr: "10.70.20.0/24"
+
+# Built from the inventory so adding a node needs no edit here. Kamailio's
+# dispatcher list is rendered from freeswitch_private_ips.
+edge_private_ips: "{{ groups['edge'] | map('extract', hostvars, 'ansible_host') | list }}"
+freeswitch_private_ips: "{{ groups['freeswitch'] | map('extract', hostvars, 'ansible_host') | list }}"
+app_private_ips: "{{ groups['control_plane'] | map('extract', hostvars, 'ansible_host') | list }}"
+
+# The edge's PUBLIC addresses, for hosts that are not the edge.
+#
+# kamailio_public_ip is a host_var on the edge (see hosts.yml, and the note
+# there about why it cannot be discovered on the box). That makes it undefined
+# everywhere else — including on the app tier, whose control plane needs it to
+# check what a carrier has configured as its Origination URI.
+#
+# Extracted here rather than copied, for the same reason as the lists above:
+# one place holds the address, and a second edge changes nothing but hosts.yml.
+edge_public_ips: "{{ groups['edge'] | map('extract', hostvars, 'kamailio_public_ip') | list }}"
+
+########################################################
+# Ports. These are duplicated in Terraform variables by necessity — the
+# security groups have to open what the daemons bind to — so treat the
+# Terraform values as the source of truth and keep these in step.
+#
+# A mismatch between the two is not a config error that shows up as an error.
+# It shows up as calls that set up and have no audio (RTP range), or an ESL
+# socket that is refused (8022). Neither names the port in the message.
+########################################################
+sip_port: 5060
+sips_port: 5061
+
+rtpengine_ng_port: 2223
+rtpengine_port_min: 30000
+rtpengine_port_max: 40000
+
+freeswitch_sip_port: 5060
+freeswitch_rtp_port_min: 16384
+freeswitch_rtp_port_max: 32768
+freeswitch_esl_inbound_port: 8021
+freeswitch_xmlrpc_port: 8085
+
+# kamailio_xhttp_port IS GONE. It opened a tcp control listener on the edge for
+# the control plane to drive outbound originate over xhttp. Originate is now
+# controller -> FreeSWITCH over ESL :{{ freeswitch_esl_inbound_port }}, so
+# Kamailio is out of the control path entirely (docs/API.md, Contract 3).
+#
+# The matching security group rule (edge_ctrl_http) and the Terraform variable
+# behind it are removed with it — a listener and a rule left behind for a path
+# nothing uses is something the next person wires to.
+
+########################################################
+# The &socket() target — where FreeSWITCH opens its per-call outbound ESL
+# connection (arrow 3 in the architecture diagram).
+#
+# A ROUTE53 RECORD, NOT AN ADDRESS, and that is the whole point of it being a
+# record. It resolves straight to the app instance (there is no load balancer),
+# so the controller can be replaced or moved and FreeSWITCH follows without a
+# play — repoint the record instead.
+#
+# Get the value from Terraform rather than typing it:
+#   cd infra/iac && make output STACK=control-plane ENV=beta EXTRA="-raw esl_target"
+#
+# A WRONG VALUE HERE DROPS EVERY INBOUND CALL AT ANSWER, and the symptom is
+# calls ending immediately with nothing in the controller's log — because the
+# controller was never reached. Worth verifying from a FreeSWITCH box directly:
+#   getent hosts esl.beta.intron.internal
+#   nc -vz esl.beta.intron.internal 8022
+########################################################
+internal_dns_zone: beta.intron.internal
+freeswitch_esl_outbound_target: "esl.beta.intron.internal:8022"
+
+# routing_service_url IS GONE. It pointed Kamailio's http_client at the control
+# plane for the per-INVITE admission lookup, and nothing performs that lookup
+# any more — the controller resolves tenant and plan in-process against
+# Postgres, with the call already in hand (docs/API.md, Contract 1).
+#
+# The control-plane API still exists and still listens on
+# api.{{ internal_dns_zone }}:{{ api_listener_port | default(8080) }}; it is
+# just not in the call path, so nothing in Ansible needs its address.
+
+########################################################
+# Secrets Manager container names. The roles pass these to
+# /usr/local/bin/fetch-and-render-secrets.sh from each unit's ExecStartPre.
+#
+# Values are NOT managed by Terraform and NOT stored here. They are pushed
+# out-of-band with bin/env-file-to-sm, and fetched by the instance at service
+# start using its instance profile. Nothing resolved ever transits Ansible's
+# S3 transport bucket — which is why the templates in these roles are deployed
+# as .tpl files with ${VAR} placeholders and substituted on the box.
+########################################################
+secret_prefix: "intron-sip/{{ env_name }}"
+# kamailio_secret_id IS GONE, along with the container it named. Kamailio reads
+# no credentials: the admission token left when admission moved to the
+# controller, and the ESL password left when originate became controller ->
+# FreeSWITCH. The edge instance role no longer has secrets-read either.
+freeswitch_secret_id: "{{ secret_prefix }}/freeswitch"
+esl_controller_secret_id: "{{ secret_prefix }}/esl-controller"
+control_plane_secret_id: "{{ secret_prefix }}/control-plane"
+
+########################################################
+# LiveKit — arrow 4, the AI leg. IN OUR OWN VPC.
+#
+# FreeSWITCH bridges the B-leg through Kamailio to livekit-sip, so Kamailio
+# needs a dispatcher destination pointing at it.
+#
+# WHAT THIS USED TO BE, AND WHY IT CHANGED. This was an internet SIP trunk to
+# Intron's LiveKit in another AWS account — SIP-TLS on 5061 with SRTP required,
+# because our own clinical audio would otherwise cross the open internet in the
+# clear. That design also needed things this repo could not arrange: a stable
+# public address on their side, their media ports opened to our Elastic IP, a
+# certificate both ends accept, and an inbound trunk and dispatch rule their
+# deployment has never had.
+#
+# We run livekit-sip ourselves instead (see iac/stacks/livekit). The models
+# stay on Intron's GPU box: a LiveKit agent is a CLIENT, so their worker dials
+# OUT to our server and nothing inbound touches their estate.
+#
+# The consequence for this file is that the whole leg became private. Both the
+# certificate question and the SRTP question disappeared, because there is no
+# longer an internet hop to protect.
+#
+# THE HOST IS livekit-sip's PRIVATE ADDRESS, from the livekit group in
+# hosts.yml rather than written twice.
+########################################################
+livekit_sip_host: "{{ hostvars['beta-livekit-1'].ansible_host }}"
+
+########################################################
+# PLAIN UDP, and this is a downgrade from tls that is correct rather than
+# convenient.
+#
+# The old value was tls because the leg crossed the open internet between two
+# accounts. It no longer does: Kamailio and livekit-sip are in the same VPC,
+# and the SIP port on the LiveKit box is open only to the EDGE SECURITY GROUP
+# — not to a CIDR, and certainly not to the internet. That is the same trust
+# boundary every carrier interconnect relies on, applied to a path that is
+# metres long instead of continents.
+#
+# MUST MATCH livekit_sip_transport in iac/stacks/sip-core/beta/main.tf, which
+# decides whether 5061/tcp or 5060/udp is opened on the edge. A mismatch
+# presents as calls that set up and then die at media negotiation, which reads
+# as a codec problem rather than a firewall one.
+#
+# The scheme, not the port, selects TLS — a sip: URI aimed at 5061 is dropped
+# by the far end with "no route" and nothing naming TLS. The dispatcher
+# template branches on this variable for that reason, so the two cannot drift.
+########################################################
+livekit_sip_transport: udp
+livekit_sip_port: 5060
+
+# No longer meaningful on a private leg, and left explicit rather than deleted:
+# if this ever goes back over a public path, this is the line that has to
+# return to true along with livekit_sip_transport.
+livekit_srtp_required: false

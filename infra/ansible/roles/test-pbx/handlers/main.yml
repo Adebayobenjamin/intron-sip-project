@@ -1,0 +1,11 @@
+---
+# A restart drops any call in progress. That is acceptable here and nowhere
+# else in this repo: this box carries test calls only, and the alternative -
+# `core reload` - does not pick up pjsip transport changes, which fails by
+# leaving the daemon running with a transport that no longer matches its
+# config.
+- name: restart asterisk
+  ansible.builtin.systemd:
+    name: asterisk
+    state: restarted
+    daemon_reload: true

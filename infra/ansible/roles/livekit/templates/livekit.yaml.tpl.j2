@@ -1,0 +1,123 @@
+{{ ansible_managed | comment }}
+# LiveKit server config.
+#
+# DEPLOYED AS .tpl. The ${...} placeholders below are substituted ON THE BOX at
+# every service start by fetch-and-render-secrets.sh, from Secrets Manager,
+# using the instance profile. Ansible never sees the resolved values, so no
+# secret reaches this repository, the S3 transport bucket, or a play's diff.
+#
+# The rendered sibling (livekit.yaml, without .tpl) is what the container
+# reads, and the unit fails closed if substitution did not happen.
+
+port: {{ livekit_api_port }}
+
+# Empty string means all interfaces. The box has one NIC and a security group
+# in front of it; binding to the private address instead would be a second
+# place to get the public/private distinction wrong.
+bind_addresses:
+  - ""
+
+rtc:
+  tcp_port: {{ livekit_rtc_tcp_port }}
+  port_range_start: {{ livekit_rtc_udp_port_min }}
+  port_range_end: {{ livekit_rtc_udp_port_max }}
+
+  ########################################################
+  # THE ADVERTISED-ADDRESS TRAP, WebRTC edition.
+  #
+  # This instance holds the PRIVATE address on its NIC. The Elastic IP is
+  # mapped 1:1 at the VPC edge and the OS never sees it. WebRTC carries
+  # addresses inside ICE candidates the same way SIP carries them in SDP, so
+  # without this LiveKit advertises 10.70.x.x, every client tries to reach a
+  # private address across the internet, and the call connects with no media.
+  #
+  # `true` makes LiveKit query a public STUN server at startup to learn its own
+  # address. That means EGRESS MUST BE OPEN - with it closed the lookup fails,
+  # LiveKit falls back to the private address, and you get the exact failure
+  # this setting exists to prevent, from a completely different cause.
+  ########################################################
+  use_external_ip: true
+
+  # Loopback candidates are useful only when client and server share a host.
+  # Here they are noise that lengthens ICE negotiation for every call.
+  enable_loopback_candidate: false
+
+########################################################
+# Redis. Required, and single-node on purpose.
+#
+# LiveKit uses it for room state. A multi-node LiveKit needs a SHARED Redis so
+# every node agrees on which node owns a room; this deployment is one node, so
+# a local container is correct and a managed ElastiCache instance would be
+# paying for a guarantee nothing needs yet.
+#
+# If a second node is ever added, this is the first thing that has to move -
+# and the failure if it does not is a caller and their agent joining the
+# same-named room on different servers, which presents as a call that connects
+# and hears silence.
+########################################################
+redis:
+  address: localhost:6379
+
+########################################################
+# API keys. THE ONLY ACCESS CONTROL ON THIS SERVER.
+#
+# The security group is open to the internet on purpose - the clients are a
+# browser on a laptop and an agent behind somebody else's NAT gateway, so
+# there is no list to write. Every room join and every API call presents a JWT
+# signed with this secret; without one, a 401 and a closed socket.
+#
+# THE SAME PAIR LIVES IN THREE PLACES and nothing keeps them in step: here,
+# our esl-controller's secret, and Intron's agent .env in another AWS account.
+# Rotate all three together.
+########################################################
+keys:
+  ${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}
+
+########################################################
+# TURN - the relay of last resort.
+#
+# The media fallback chain is direct UDP, then TCP, then this. A caller inside
+# a hospital or corporate network is frequently on the last rung, so this is
+# not a nicety for the clinical context this platform serves.
+#
+# external_tls: true means CADDY terminates TLS on 443 and proxies plaintext to
+# tls_port below. LiveKit therefore does NOT need a certificate of its own, and
+# tls_port is loopback-only with no security group rule.
+#
+# `domain` MUST be the TURN hostname, not the main one. Caddy separates the two
+# services on 443 by TLS SNI and SNI carries a hostname, which is why there are
+# two DNS records for one instance. Put the main name here and clients are
+# handed a TURN address that routes to the WebSocket, failing at the handshake.
+########################################################
+turn:
+  enabled: true
+  domain: {{ livekit_turn_fqdn }}
+  tls_port: {{ livekit_turn_tls_port }}
+  udp_port: {{ livekit_turn_udp_port }}
+  external_tls: true
+
+  # THE RELAY RANGE, and it is not the same thing as udp_port above.
+  #
+  # udp_port is where a client ASKS for a relay. The relay is then allocated on
+  # a port in this range and the media flows there. Opening only udp_port in
+  # the security group gives you a TURN server that negotiates successfully and
+  # relays into a dropped port - audio simply never arrives, for the subset of
+  # clients that needed TURN in the first place.
+  #
+  # Set EXPLICITLY rather than left to the default, even though these ARE the
+  # defaults. The security group has to name the same numbers, and a default
+  # that changes in a future release would silently desync the two.
+  relay_range_start: {{ livekit_turn_relay_port_min }}
+  relay_range_end: {{ livekit_turn_relay_port_max }}
+
+########################################################
+# Room defaults.
+########################################################
+room:
+  # Seconds to keep a room alive after the last participant leaves. See the
+  # note in the role's defaults - the stock 20s produces dead air after a
+  # caller hangs up, and inflates every session duration in the call record.
+  departure_timeout: {{ livekit_room_departure_timeout }}
+
+logging:
+  level: {{ livekit_log_level }}

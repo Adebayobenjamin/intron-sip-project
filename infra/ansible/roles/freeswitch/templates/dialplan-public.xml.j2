@@ -1,0 +1,127 @@
+<!-- {{ ansible_managed }} -->
+<!--
+  The public context — everything arriving from the Kamailio edge.
+
+  THIS DIALPLAN MAKES NO ROUTING DECISIONS. That is the design: FreeSWITCH is a
+  dumb B2BUA, and every call hands control to the ESL controller, which decides
+  what happens next. Putting routing logic here would mean two places that
+  decide where calls go, drifting apart, one of them requiring an Ansible run
+  to change.
+-->
+<include>
+  <context name="public">
+
+    <extension name="intron_inbound">
+      <condition field="destination_number" expression="^(.*)$">
+
+        <!--
+          Answer semantics, in order, and the order matters.
+
+          pre_answer rather than answer: the call is not answered until the
+          controller says to. Answering first would start billing on the
+          carrier leg for a call that may turn out to be unroutable, and would
+          make a rejection look to the caller like a call that connected and
+          then died.
+        -->
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="set" data="continue_on_fail=false"/>
+
+        <!--
+          intron_tenant and intron_plan USED TO BE SET HERE, from the
+          X-Intron-Tenant / X-Intron-Plan headers Kamailio appended after its
+          admission lookup. Both are deleted because Kamailio no longer makes
+          that lookup or appends those headers — the controller resolves tenant
+          and plan itself, in-process, once it has the call (docs/API.md,
+          Contract 1).
+
+          DELETED RATHER THAN LEFT TO RESOLVE EMPTY, and that is the point.
+          `set` against a missing header does not fail; it produces a variable
+          that exists and is "". Code reading intron_tenant would get an empty
+          string, and an empty tenant scopes every query to nothing — no error
+          anywhere, just a call behaving as though the tenant has no
+          configuration.
+
+          intron_node stays: it is this node's own name, not something a header
+          carried.
+        -->
+        <action application="set" data="intron_node={{ inventory_hostname }}"/>
+
+        <!--
+          ===================================================================
+          THE NEXT HOP FOR EVERY LEG THIS CALL BRIDGES OUT TO.
+
+          Without this, a bridged B-leg goes straight to whatever its
+          Request-URI resolves to — for a handoff, the client's SBC; for a
+          carrier destination, the carrier — BYPASSING KAMAILIO AND RTPENGINE
+          entirely. The call sets up cleanly and has no audio, because the SDP
+          then carries this node's private address and nothing rewrote it.
+          For a carrier it fails differently and more loudly: the INVITE
+          leaves via the NAT gateway, whose address is not in Twilio's
+          Termination IP ACL, and Twilio answers 403.
+
+          `nolocal:` puts the variable on the OUTBOUND leg only. Without the
+          prefix it would also land on this inbound channel, where a next-hop
+          override has no meaning and could affect how in-dialog requests are
+          sent back toward Kamailio.
+
+          WHY HERE AND NOT IN THE CONTROLLER'S DIAL STRING. Which edge this
+          node sends through is a fact about THIS FreeSWITCH node, and Ansible
+          already knows it — edge_private_ips comes from the inventory. Putting
+          a second copy in the controller's environment would be one address in
+          two places with nothing keeping them in step.
+
+          THIS DOES NOT COVER OUTBOUND ORIGINATE. An originate has no inbound
+          A-leg, so no dialplan runs and this export never executes — the
+          controller must carry sip_route_uri in the originate dial string
+          itself (docs/API.md, Contract 3). The two paths are not redundant;
+          they are different paths.
+
+          Verify it lands on the B-leg the first time a call bridges:
+            fs_cli -x "uuid_dump <b-leg-uuid>" | grep sip_route_uri
+          ===================================================================
+        -->
+        <action application="export"
+                data="nolocal:sip_route_uri=sip:{{ edge_private_ips[0] }}:{{ sip_port }}"/>
+
+        <!--
+          ===================================================================
+          ARROW 3 IN THE ARCHITECTURE DIAGRAM.
+
+          FreeSWITCH opens a TCP connection to the ESL controller and hands it
+          the call. `async full` means the controller gets the full event
+          stream and can issue commands, and the socket stays open FOR THE LIFE
+          OF THE CALL.
+
+          That last part is what every deploy decision in the control-plane
+          stack is built around: the NLB's 3600s deregistration delay, the
+          raised TCP idle timeout, the drain in the systemd ExecStop, and the
+          two app instances that make draining possible at all.
+
+          THE TARGET IS A DNS NAME, NEVER AN ADDRESS. A Route53 record in the
+          private zone, pointing at the internal NLB. That indirection is what
+          makes the controller replaceable without touching a single
+          FreeSWITCH node.
+
+          IF THIS VALUE IS WRONG, EVERY INBOUND CALL DROPS AT ANSWER, and the
+          controller's log shows nothing at all — because it was never reached.
+          The freeswitch role checks reachability at the end of the play for
+          exactly this reason.
+          ===================================================================
+        -->
+        <action application="socket" data="{{ freeswitch_esl_outbound_target }} async full"/>
+
+        <!--
+          Reached only if the socket application returns without the controller
+          having bridged or hung up the call — which means the controller
+          accepted the connection and then failed. 503 rather than a silent
+          hangup so the carrier sees a cause code and it appears in the CDR as
+          a platform failure rather than as a normal clearing.
+        -->
+        <action application="log" data="ERR controller returned without handling call uuid=${uuid} did=${destination_number}"/>
+        <action application="hangup" data="NORMAL_TEMPORARY_FAILURE"/>
+
+      </condition>
+    </extension>
+
+  </context>
+</include>

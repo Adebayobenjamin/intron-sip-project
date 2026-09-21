@@ -1,0 +1,294 @@
+---
+########################################################
+# RTPEngine — the media relay at the edge.
+#
+# Its entire job is to sit between the carrier and the FreeSWITCH farm so the
+# farm's private addresses never appear in an SDP. Everything below is in
+# service of one thing being right: the address it advertises.
+#
+# PACKAGE NAMING. Debian ships these WITHOUT the "ngcp-" prefix that the
+# upstream/Sipwise builds use:
+#
+#   rtpengine-daemon        not  ngcp-rtpengine-daemon
+#   rtpengine-iptables      not  ngcp-rtpengine-iptables
+#   rtpengine-kernel-dkms   not  ngcp-rtpengine-kernel-dkms
+#
+# and the unit is rtpengine-daemon.service (with rtpengine.service as an
+# alias). Most RTPEngine material online uses the ngcp- names, so this is an
+# easy and confusing thing to get wrong - apt's error is "No package matching
+# 'ngcp-rtpengine-daemon' is available", which names the symptom and not the
+# fact that the package is right there under another name.
+########################################################
+
+- name: Install RTPEngine
+  ansible.builtin.apt:
+    name: "{{ rtpengine_packages }}"
+    state: present
+    update_cache: true
+
+########################################################
+# In-kernel forwarding.
+#
+# Roughly an order of magnitude more packets per second than userspace, because
+# relayed packets never cross into user memory. RTPEngine installs the mapping
+# once at call setup and the kernel forwards from then on; the daemon stays in
+# the path only for what the kernel cannot do - the ng control protocol, DTLS
+# handshakes, and anything needing re-encryption.
+#
+# ORDER MATTERS AND IS DELIBERATE. The module is installed and loaded BEFORE
+# rtpengine.conf is written, so a DKMS failure stops the play while the daemon
+# is still running the config it already had. Writing `table = 0` against a
+# module that is not loaded is a media outage on a box that looks configured.
+########################################################
+
+# DKMS builds against the RUNNING kernel, so its headers must be installable.
+# Debian drops headers for superseded point releases out of the archive, so a
+# box running a kernel it has not rebooted into cannot build the module at all
+# - and apt's error ("No package matching linux-headers-6.1.0-53-cloud-amd64")
+# describes the symptom rather than the cause. Check first and say so plainly.
+- name: Check that headers for the running kernel are installable
+  ansible.builtin.command:
+    cmd: "apt-cache policy linux-headers-{{ ansible_facts['kernel'] }}"
+  register: rtpengine_headers_policy
+  changed_when: false
+  failed_when: false
+  when: rtpengine_kernel_module | bool
+
+- name: Fail clearly when the running kernel is too old to build against
+  ansible.builtin.assert:
+    that:
+      - rtpengine_headers_policy.rc == 0
+      - "'Candidate: (none)' not in rtpengine_headers_policy.stdout"
+    fail_msg: >-
+      No installable headers for the running kernel
+      ({{ ansible_facts['kernel'] }}), so the RTPEngine kernel module cannot be
+      built. This host is running a superseded kernel whose headers have been
+      removed from the archive - `apt list --installed 'linux-image-*'` will
+      show a newer one already installed. REBOOT this node into the current
+      kernel and re-run. Nothing has been changed by this play.
+    success_msg: "headers available for {{ ansible_facts['kernel'] }}"
+  when: rtpengine_kernel_module | bool
+
+- name: Install the RTPEngine kernel module (DKMS)
+  ansible.builtin.apt:
+    name: "{{ rtpengine_kernel_packages }}"
+    state: present
+    update_cache: true
+  when: rtpengine_kernel_module | bool
+  notify: restart rtpengine
+
+# NO failed_when: false HERE, and that is the point. If DKMS did not produce a
+# module, this fails the play - which is better than a config pointing at a
+# forwarding table the kernel does not have.
+- name: Load the xt_RTPENGINE kernel module
+  community.general.modprobe:
+    name: xt_RTPENGINE
+    state: present
+  when: rtpengine_kernel_module | bool
+
+- name: Persist the module across reboots
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/rtpengine.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible - kernel-space RTP forwarding for rtpengine.
+      # Without this the daemon can start before the module on reboot and fall
+      # back to userspace relaying, silently costing most of the box's
+      # packet-per-second capacity.
+      xt_RTPENGINE
+  when: rtpengine_kernel_module | bool
+
+########################################################
+# /etc/default/rtpengine-daemon is EDITED IN PLACE, NOT TEMPLATED.
+#
+# The package ships it with CONFIG_FILE, PIDFILE, MANAGE_IPTABLES, SET_USER and
+# SET_MASK already set. This role used to render the whole file from a template
+# carrying RUN_RTPENGINE / CONFIG_FILE / MAXFD - names from the old ngcp init
+# script, none of which this package reads - and doing so would have SILENTLY
+# DROPPED SET_USER=rtpengine and MANAGE_IPTABLES=yes.
+#
+# MANAGE_IPTABLES is the only key here worth our opinion: the unit's
+# ExecStartPre (/usr/sbin/rtpengine-iptables-setup) reads it to decide whether
+# to insert the rule that diverts media into the kernel module. It has to track
+# the kernel-module decision, or the module is loaded with nothing routed to it.
+#
+# The fd limit needs no attention: the shipped unit already sets
+# LimitNOFILE=150000, well above what the port range can consume.
+########################################################
+- name: Match iptables management to the kernel-forwarding decision
+  ansible.builtin.lineinfile:
+    path: /etc/default/rtpengine-daemon
+    regexp: '^MANAGE_IPTABLES='
+    line: 'MANAGE_IPTABLES={{ "yes" if rtpengine_kernel_module | bool else "no" }}'
+  notify: restart rtpengine
+
+########################################################
+# THE ADVERTISED ADDRESS.
+#
+#   interface = private/PRIVATE!PUBLIC
+#
+# AWS maps an Elastic IP 1:1 at the VPC edge. The instance has exactly one NIC
+# carrying exactly one address — the private 10.70.0.x one — and there is
+# nothing on the box that reveals the public address. RTPEngine cannot discover
+# it and must be told.
+#
+# Get this wrong and the rewritten SDP offers a 10.x address to a carrier that
+# cannot route there. THE CALL SETS UP PERFECTLY. Signalling is clean end to
+# end, the carrier sends 200 OK, FreeSWITCH answers — and there is no audio in
+# either direction. It is the single most common way to lose a day doing SIP on
+# AWS, because every diagnostic that looks at signalling says everything is
+# fine.
+#
+# The public address comes from Terraform via the inventory (kamailio_public_ip,
+# per-host). playbooks/edge.yml asserts it is set before this role runs.
+########################################################
+- name: Deploy the RTPEngine configuration
+  ansible.builtin.template:
+    src: rtpengine.conf.j2
+    dest: /etc/rtpengine/rtpengine.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart rtpengine
+
+########################################################
+# The packaged unit orders itself after network-online.target but sets no
+# Restart=. RTPEngine binds listen-ng and the media interface to the private
+# address, and exits fatally with EADDRNOTAVAIL if that address is not on the
+# interface yet — network-online.target does not guarantee a DHCP lease has
+# been applied. With no Restart=, the daemon then stays dead until someone
+# notices, and what they notice is calls with no audio rather than a dead
+# service.
+########################################################
+- name: Ensure the RTPEngine drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/rtpengine-daemon.service.d
+    state: directory
+    mode: "0755"
+
+- name: Make RTPEngine survive the boot-time private-IP race
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/rtpengine-daemon.service.d/override.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible - do not edit manually.
+      # The daemon binds to {{ ansible_host }} and exits if that address is not
+      # up yet at boot. Retry indefinitely rather than staying dead.
+      [Unit]
+      StartLimitIntervalSec=0
+
+      [Service]
+      Restart=on-failure
+      RestartSec=3
+  notify: restart rtpengine
+
+- name: Enable and start RTPEngine
+  ansible.builtin.systemd:
+    name: rtpengine-daemon
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Flush handlers so the config is live before it is verified
+  ansible.builtin.meta: flush_handlers
+
+########################################################
+# Verification. Both checks exist because both failures are silent.
+########################################################
+- name: Check whether kernel forwarding is actually active
+  ansible.builtin.stat:
+    path: "/proc/rtpengine/{{ rtpengine_table }}/control"
+    # ALL THREE READS MUST BE OFF. stat checksums by default, which means
+    # OPENING the file — and these are kernel control interfaces, not files.
+    # The daemon holds them, so the open returns EBUSY and the task dies with
+    #
+    #   [Errno 16] Device or resource busy: b'/proc/rtpengine/0/control'
+    #
+    # while the thing being tested is working perfectly. (The table-level
+    # control node is also mode --w--w----, so a read cannot succeed even
+    # unheld.) get_mime shells out to `file`, which opens it too.
+    #
+    # Existence is the whole question here. Do not add reads back.
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  register: rtpengine_kernel_iface
+  when: rtpengine_kernel_module | bool
+
+# ASSERT, not warn. This used to be a debug task, which printed the problem and
+# let the play finish green - in a role whose own header says the module is
+# "asserted rather than assumed", and for a failure whose entire character is
+# that nobody notices it. A warning in a few hundred lines of play output is
+# the same as no warning.
+- name: Fail if RTPEngine fell back to userspace forwarding
+  ansible.builtin.assert:
+    that:
+      - rtpengine_kernel_iface.stat.exists | default(false)
+    fail_msg: >-
+      xt_RTPENGINE is loaded but /proc/rtpengine/{{ rtpengine_table }}/control
+      does not exist, so RTPEngine is forwarding in USERSPACE. Calls will work
+      and the box has a fraction of its intended packet-per-second capacity,
+      which shows up later as loss under load that looks like an undersized
+      instance. Check `dkms status`, `lsmod | grep xt_RTPENGINE` and
+      `journalctl -u rtpengine-daemon`. To proceed deliberately without the
+      module, set rtpengine_kernel_module=false - which is an explicit choice
+      rather than an accident.
+    success_msg: "kernel forwarding active on table {{ rtpengine_table }}"
+  when: rtpengine_kernel_module | bool
+
+########################################################
+# Verify the ng control port by SPEAKING THE PROTOCOL.
+#
+# Kamailio drives RTPEngine over this socket on every offer and answer. If it
+# is not answering, every call sets up with no media — and Kamailio logs that
+# as a timeout rather than as a missing service.
+#
+# NOT wait_for. THE NG PORT IS UDP:
+#
+#   UNCONN 0 0 127.0.0.1:2223 0.0.0.0:* users:(("rtpengine",...))
+#
+# and wait_for only does a TCP connect, so it times out after 30s against a
+# perfectly healthy daemon. That is not a flaky check, it is a check that
+# cannot ever pass — which is worse, because the obvious reading of the failure
+# is "RTPEngine is broken" and the obvious fix is to go and restart it.
+#
+# A ping/pong over the real ng protocol is better than a socket test anyway: a
+# bound socket only proves the process started, while a pong proves it is
+# parsing control messages. The wire format is a cookie, a space, then bencode:
+#
+#   ->  <cookie> d7:command4:pinge      {"command": "ping"}
+#   <-  <cookie> d6:result4:ponge       {"result": "pong"}
+#
+# dd with count=1 returns on the first datagram — head -c N would block until N
+# bytes accumulate, which never happens because the reply is shorter than any
+# round number and UDP never signals EOF.
+########################################################
+- name: Verify RTPEngine answers on the ng control port
+  ansible.builtin.shell: |
+    set -euo pipefail
+    host="{{ rtpengine_listen_ng.split(':')[0] }}"
+    port="{{ rtpengine_listen_ng.split(':')[1] }}"
+    exec 3<>"/dev/udp/${host}/${port}"
+    printf 'ansible%s d7:command4:pinge' "$$" >&3
+    timeout 5 dd bs=1024 count=1 status=none <&3
+  args:
+    executable: /bin/bash
+  register: rtpengine_ng_ping
+  changed_when: false
+  failed_when: false
+
+- name: Fail if RTPEngine is not answering ng control messages
+  ansible.builtin.assert:
+    that:
+      - rtpengine_ng_ping.rc == 0
+      - "'pong' in rtpengine_ng_ping.stdout"
+    fail_msg: >-
+      RTPEngine is not answering ng control messages on
+      {{ rtpengine_listen_ng }}. Kamailio calls this socket on every offer and
+      answer, so every call would set up and have NO AUDIO, and Kamailio would
+      log it as a timeout rather than as a missing service. Check
+      `systemctl status rtpengine-daemon`, `ss -lnup | grep {{ rtpengine_ng_port }}`
+      and that listen-ng in /etc/rtpengine/rtpengine.conf matches what
+      kamailio.cfg points its rtpengine module at.
+      Got rc={{ rtpengine_ng_ping.rc }}, reply={{ rtpengine_ng_ping.stdout | default('') | trim }}
+    success_msg: "ng control socket answered pong on {{ rtpengine_listen_ng }}"

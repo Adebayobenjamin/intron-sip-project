@@ -1,0 +1,77 @@
+<!-- {{ ansible_managed }}
+
+  THIS IS THE .tpl. The password placeholder below is substituted at every
+  service start by /usr/local/bin/fetch-and-render-secrets.sh, reading
+  {{ freeswitch_secret_id }} from AWS Secrets Manager via the instance profile.
+  The rendered .xml is what FreeSWITCH reads and Ansible never writes it.
+
+  NOTE THE PROSE HERE NEVER SPELLS THE PLACEHOLDER. Substitution is a blind
+  pass over the whole file, so a dollar-brace form written in a comment is
+  replaced there too - the first version of this file said "the
+  <dollar-brace>FREESWITCH_ESL_PASSWORD placeholder below", and the rendered
+  XML duly carried the live ESL password inside its documentation, in a second
+  place nobody would think to rotate or grep for. Name the variable in prose
+  without the dollar and braces, as above.
+
+  THIS FILE IS THE INBOUND DIRECTION ONLY - the controller connecting IN to
+  issue commands and subscribe to events. Both directions exist and they are
+  easy to confuse:
+
+    inbound ESL    controller -> this node :{{ freeswitch_esl_inbound_port }}
+                   originate, uuid_*, the event stream. Configured HERE.
+    outbound ESL   this node -> {{ freeswitch_esl_outbound_target }}
+                   one socket per call, "is this routable?". Configured in the
+                   DIALPLAN, not here.
+-->
+<configuration name="event_socket.conf" description="Socket Client">
+  <settings>
+    <!--
+      Bound to the private address, not 0.0.0.0. The security group already
+      restricts this port to the app subnets, but binding narrowly means a
+      security group edit cannot accidentally widen it - ESL is a full remote
+      control interface for the switch, and an exposed one is a platform
+      compromise rather than an information leak.
+    -->
+    <param name="listen-ip" value="{{ ansible_host }}"/>
+    <param name="listen-port" value="{{ freeswitch_esl_inbound_port }}"/>
+    <param name="password" value="${FREESWITCH_ESL_PASSWORD}"/>
+
+    <!--
+      THIS LINE IS REQUIRED, AND OMITTING IT DOES NOT MEAN "NO ACL".
+
+      mod_event_socket installs its own ACL when none is configured
+      (mod_event_socket.c, in the config load):
+
+          if (!prefs.acl_count) {
+              prefs.acl[prefs.acl_count++] = strdup("loopback.auto");
+          }
+
+      So leaving this out is not the permissive choice it looks like - it is
+      the most restrictive one, loopback only, which rejects the controller on
+      the app subnet. An earlier version of this file left it out on purpose,
+      with a comment claiming the loopback default came from the vanilla
+      config and that omission disabled it. That was wrong on both counts.
+
+      What it looks like when it bites: the TCP handshake succeeds, the switch
+      replies "Access Denied, go away." (Content-Type: text/rude-rejection) and
+      disconnects. Reads as a network fault; is not one. Nothing appears in the
+      log at the default level. Reproduce with:
+
+          fs_cli -x status                       # Error Connecting []
+          exec 3<>/dev/tcp/{{ ansible_host }}/{{ freeswitch_esl_inbound_port }}; head -c 200 <&3
+
+      The "esl" list is defined in acl.conf.xml, deployed by this same role.
+      It admits the app subnets and this node. Changing the list needs a
+      RESTART, not a reloadxml - see the handler comments.
+    -->
+    <param name="apply-inbound-acl" value="esl"/>
+
+    <!--
+      The password must match FREESWITCH_ESL_PASSWORD in the kamailio and
+      esl-controller Secrets Manager containers. Three copies of one credential
+      - the two sides of the connection plus the proxy that also originates -
+      and nothing keeps them in step. Rotate all three together, or inbound ESL
+      starts failing auth with a message that names none of them.
+    -->
+  </settings>
+</configuration>

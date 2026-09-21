@@ -1,0 +1,13 @@
+---
+# Restarting RTPEngine DROPS THE MEDIA OF EVERY CALL IN PROGRESS. Signalling
+# survives — Kamailio and FreeSWITCH keep the dialogs — so callers stay
+# connected to silence until someone hangs up, which is worse than a clean
+# drop and harder to attribute.
+#
+# There is no graceful restart. Treat any change that notifies this handler as
+# a maintenance-window change.
+- name: restart rtpengine
+  ansible.builtin.systemd:
+    name: rtpengine-daemon
+    state: restarted
+    daemon_reload: true

@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# =============================================================================
+# Control-plane VM bootstrap (EC2 user_data)
+# =============================================================================
+# Does exactly two things: name the box, and get the SSM agent running so
+# Ansible can reach it. Everything else — Docker, the systemd units, the
+# service env files, secrets — is the Ansible roles' job.
+#
+# DOCKER IS DELIBERATELY NOT INSTALLED HERE. It is a versioned dependency that
+# will need upgrading on a running box, and anything that has to change without
+# rebuilding the instance belongs in a play, not in user_data that runs once.
+#
+# This file is a near-copy of the one in stacks/sip-core/_main/scripts. Kept
+# separate rather than shared because a Terraform module reaching into a
+# sibling module's directory works right up until one of them moves. If they
+# drift apart in a way that matters, that is the signal to make it a proper
+# shared module rather than to re-link them.
+#
+# Keep it that way. user_data runs ONCE, at first boot, and changing it
+# replaces the instance (user_data_replace_on_change = true). Anything that
+# might need to change without rebuilding the box does not belong in here.
+#
+# NOTE ON HOW LITTLE THIS DOES compared with the equivalent script on Hetzner.
+# There is no NIC discovery, no DHCP wait, no netplan file, no default route to
+# install, and no DNS to configure. An EC2 instance has one interface, gets its
+# address and routes from the VPC before cloud-init runs, and resolves through
+# the VPC resolver. The entire class of "the private NIC never came up and
+# nothing noticed for months" bug does not exist here.
+#
+# Rendered by Terraform's templatefile(). A single-dollar placeholder is
+# Terraform interpolation and is replaced before the script ever runs; a
+# double-dollar one is an escape that reaches the shell as an ordinary
+# variable reference. Every shell variable below is therefore written $${NAME}.
+# Getting this backwards is the usual way to produce a user_data script that
+# fails at plan time complaining about a key that is obviously a shell
+# variable — which is exactly what this comment did when it spelled the
+# placeholder out literally.
+# =============================================================================
+
+set -euo pipefail
+
+exec > >(tee -a /var/log/vm-bootstrap.log) 2>&1
+echo "[bootstrap] start $(date -Is) role=${role} host=${hostname}"
+
+# -------------------- Identity --------------------------------------------
+# Set before anything else: the hostname shows up in SSM's instance list, in
+# CloudWatch log streams, and in FreeSWITCH's own logs, and a fleet of boxes
+# all called "debian" is unworkable during an incident.
+hostnamectl set-hostname "${hostname}"
+
+# Debian's cloud image leaves 127.0.1.1 mapped to the DHCP-supplied name.
+# Point it at ours so anything resolving its own hostname (sudo is the usual
+# one, with a ten-second delay when it fails) gets an answer immediately.
+if ! grep -q "${hostname}" /etc/hosts; then
+  echo "127.0.1.1 ${hostname}" >> /etc/hosts
+fi
+
+# -------------------- AWS SSM Agent ---------------------------------------
+# The Debian AMI does NOT ship the agent — Amazon Linux and the Ubuntu images
+# do, which is the source of most "it just works" advice that does not apply
+# here.
+#
+# Fetched from the regional S3 bucket rather than a generic URL, deliberately:
+# the VPC has an S3 GATEWAY endpoint, so this download never touches the NAT
+# gateway and works identically from the private FreeSWITCH subnet and the
+# public edge subnet.
+#
+# Once installed, the agent authenticates with the INSTANCE PROFILE via IMDS.
+# No activation code, no registration step, nothing that expires.
+export DEBIAN_FRONTEND=noninteractive
+
+echo "[ssm] installing amazon-ssm-agent"
+apt-get update -y
+apt-get install -y --no-install-recommends ca-certificates curl
+
+SSM_DEB="/tmp/amazon-ssm-agent.deb"
+SSM_URL="https://s3.${aws_region}.amazonaws.com/amazon-ssm-${aws_region}/latest/debian_amd64/amazon-ssm-agent.deb"
+
+# Retry rather than fail fast. This runs seconds after the ENI comes up and
+# occasionally beats the route table into place; a box that boots without the
+# agent is a box with no way in, so it is worth being patient here.
+for attempt in 1 2 3 4 5; do
+  if curl -fsSL --retry 3 --connect-timeout 10 -o "$${SSM_DEB}" "$${SSM_URL}"; then
+    break
+  fi
+  echo "[ssm] download attempt $${attempt} failed; retrying in 10s"
+  sleep 10
+done
+
+if [ ! -s "$${SSM_DEB}" ]; then
+  echo "[ssm] FATAL: could not download the agent from $${SSM_URL}" >&2
+  echo "[ssm] this instance will be unreachable — check the S3 gateway endpoint and the subnet's route table" >&2
+  exit 1
+fi
+
+dpkg -i "$${SSM_DEB}"
+rm -f "$${SSM_DEB}"
+
+systemctl enable --now amazon-ssm-agent
+
+# -------------------- Minimum for Ansible ---------------------------------
+# The aws_ssm connection plugin runs Python modules on the target. Debian 12
+# ships python3, but confirm it rather than assume — a play that fails with
+# "/usr/bin/python3: not found" on the first task is a confusing way to learn
+# an image changed.
+if ! command -v python3 >/dev/null; then
+  apt-get install -y --no-install-recommends python3
+fi
+
+echo "[bootstrap] done $(date -Is)"

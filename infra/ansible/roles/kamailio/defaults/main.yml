@@ -1,0 +1,21 @@
+---
+kamailio_version: "5.8"
+kamailio_repo_distro: bookworm
+kamailio_config_dir: /etc/kamailio
+kamailio_modules: []
+
+# Dispatcher set IDs. Kamailio's dispatcher module groups destinations into
+# numbered sets and routes to one; these names exist so the config and the
+# dispatcher.list cannot disagree about which number means what.
+kamailio_dispatcher_set_freeswitch: 1
+kamailio_dispatcher_set_livekit: 2
+
+# How often to probe destinations for reachability. A FreeSWITCH node that has
+# stopped answering is taken out of rotation within roughly this interval;
+# until then, calls dispatched to it fail.
+kamailio_dispatcher_ping_interval: 10
+
+# SIP worker processes. Kamailio is not threaded — these are forked processes,
+# and each handles one message at a time. Too few and messages queue behind
+# whichever worker is waiting on the control-plane HTTP lookup.
+kamailio_children: 8

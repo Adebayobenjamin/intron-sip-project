@@ -1,0 +1,35 @@
+# esl-controller — the per-call control plane.
+#
+# Same architecture pin as the other image, for the same reason: the app tier
+# is x86_64, and an arm64 image built on a laptop fails at exec time with a
+# message that names nothing about architecture.
+
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+
+WORKDIR /src
+
+COPY go.mod go.su[m] ./
+RUN go mod download
+
+COPY . .
+
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+      -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION}" \
+      -o /out/esl-controller ./cmd/esl-controller
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /out/esl-controller /usr/local/bin/esl-controller
+
+# Documentation only; the unit runs --network host. 8022 is where FreeSWITCH's
+# per-call outbound socket lands, 8088 is health.
+EXPOSE 8022 8088
+
+# Non-root is safe here because both ports are above 1024. It matters more on
+# this image than the other one: this process is reachable from the FreeSWITCH
+# subnet, and the instance runs with an IMDS hop limit of 2 — so a compromised
+# container can reach the host's instance credentials.
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/esl-controller"]

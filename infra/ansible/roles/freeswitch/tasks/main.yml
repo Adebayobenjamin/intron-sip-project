@@ -1,0 +1,505 @@
+---
+########################################################
+# FreeSWITCH — the dumb B2BUA.
+#
+# Media anchor, REFER termination, CDRs. It makes NO routing decisions: every
+# inbound call opens an outbound ESL socket to the controller and asks.
+#
+# Built from source because SignalWire moved their Debian repository behind an
+# access token. The build takes ~20 minutes on c6i.xlarge and is the reason
+# ansible_aws_ssm_timeout is an hour.
+########################################################
+
+- name: Mount the recordings volume
+  ansible.builtin.import_tasks: recordings-volume.yml
+  tags: [storage]
+
+- name: Check whether FreeSWITCH is already built
+  ansible.builtin.stat:
+    path: "{{ freeswitch_prefix }}/bin/freeswitch"
+  register: freeswitch_binary
+
+- name: Build FreeSWITCH from source
+  when: not freeswitch_binary.stat.exists
+  tags: [build]
+  block:
+    - name: Install build dependencies
+      ansible.builtin.apt:
+        name:
+          - git
+          - build-essential
+          - pkg-config
+          - autoconf
+          - automake
+          - libtool
+          - libtool-bin
+          - bison
+          - flex
+          - yasm
+          - nasm
+          - libssl-dev
+          - libcurl4-openssl-dev
+          - zlib1g-dev
+          - libpcre3-dev
+          - libedit-dev
+          - libsqlite3-dev
+          - libspeex-dev
+          - libspeexdsp-dev
+          - libopus-dev
+          - libsndfile1-dev
+          - liblua5.2-dev
+          - libxml2-dev
+          - libjpeg-dev
+          - libtiff-dev
+          - libldns-dev
+          - uuid-dev
+          - libpq-dev
+          - python3
+          - python3-packaging
+        state: present
+        update_cache: true
+
+    # sofia-sip and spandsp are built from FreeSWITCH's own forks. Debian's
+    # packages are too old for the 1.10 tree and the failure is a link error
+    # deep in the FreeSWITCH build, which does not name either library.
+    - name: Build sofia-sip
+      ansible.builtin.shell: |
+        set -e
+        cd /usr/src
+        [ -d sofia-sip ] || git clone https://github.com/freeswitch/sofia-sip.git
+        cd sofia-sip
+        ./bootstrap.sh
+        ./configure
+        make -j"$(nproc)"
+        make install
+        ldconfig
+      args:
+        creates: /usr/local/lib/libsofia-sip-ua.so
+        executable: /bin/bash
+
+    - name: Build spandsp
+      ansible.builtin.shell: |
+        set -e
+        cd /usr/src
+        [ -d spandsp ] || git clone https://github.com/freeswitch/spandsp.git
+        cd spandsp
+        ./bootstrap.sh
+        ./configure --prefix=/opt/spandsp3
+        make -j"$(nproc)"
+        make install
+        echo "/opt/spandsp3/lib" > /etc/ld.so.conf.d/spandsp3.conf
+        ldconfig
+      args:
+        creates: /opt/spandsp3/lib/libspandsp.so
+        executable: /bin/bash
+
+    - name: Clone the FreeSWITCH source
+      ansible.builtin.git:
+        repo: https://github.com/signalwire/freeswitch.git
+        dest: /usr/src/freeswitch
+        version: "{{ freeswitch_branch }}"
+        depth: 1
+
+    ########################################################
+    # modules.conf must land BEFORE configure runs - configure reads it to
+    # decide what to build, and dies on mod_verto's missing libks if it is the
+    # upstream default. Inside the build block, so it is only written on a
+    # fresh build; changing the module list later means removing the binary to
+    # force a rebuild, which is deliberate friction for a 25 minute operation.
+    ########################################################
+    - name: Deploy modules.conf (controls what gets compiled)
+      ansible.builtin.template:
+        src: modules.conf.j2
+        dest: /usr/src/freeswitch/modules.conf
+        mode: "0644"
+
+    ########################################################
+    # Prove the rendered file is module paths and NOTHING else.
+    #
+    # Cheap, and it replaces a failure that costs 25 minutes and names neither
+    # this file nor the reason. src/mod/Makefile.am does not skip comments - it
+    # strips the "#" (`sed -e 's|#||'`) and turns every remaining word in the
+    # file into a make target suffixed with -all/-clean/-install. A prose
+    # header is therefore not ignored; it is compiled. The first version of
+    # this template had one, and a single word ending in a colon surfaced as
+    #
+    #     Makefile:719: *** multiple target patterns.  Stop.
+    #
+    # AFTER the core had already built. Anything that is not a bare
+    # <dir>/mod_<name> line is a build failure waiting for the slow part to
+    # finish, so fail here instead.
+    ########################################################
+    - name: Assert modules.conf contains only module paths
+      ansible.builtin.shell: |
+        set -euo pipefail
+        grep -nvE '^[a-z_]+/mod_[a-z0-9_]+$' /usr/src/freeswitch/modules.conf || true
+      args:
+        executable: /bin/bash
+      register: freeswitch_modules_conf_junk
+      changed_when: false
+
+    - name: Fail if modules.conf carries anything but module paths
+      ansible.builtin.fail:
+        msg: >-
+          /usr/src/freeswitch/modules.conf has lines that are not bare module
+          paths. Comments and blank lines are NOT safe here - FreeSWITCH's
+          src/mod/Makefile.am parses every word in this file into a make
+          target, so prose surfaces ~25 minutes into the build as
+          "Makefile:719: *** multiple target patterns". Keep explanation in
+          modules.conf.j2 as a Jinja {# #} comment, which renders to nothing.
+          Offending lines (line:content):
+          {{ freeswitch_modules_conf_junk.stdout_lines | join(' | ') }}
+      when: freeswitch_modules_conf_junk.stdout | trim | length > 0
+
+    - name: Build and install FreeSWITCH
+      # THE SLOW ONE — roughly 20 minutes on 4 vCPUs. If this is killed partway
+      # through with no clear error, suspect the OOM killer first: the build is
+      # memory-hungry and 4 GB is not enough, which is why the instance type is
+      # sized for the build rather than the call load.
+      ansible.builtin.shell: |
+        set -e
+        cd /usr/src/freeswitch
+        ./bootstrap.sh -j
+        PKG_CONFIG_PATH="/opt/spandsp3/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
+          ./configure --prefix={{ freeswitch_prefix }}
+        make -j"$(nproc)"
+        make install
+        make sounds-install moh-install || true
+      args:
+        creates: "{{ freeswitch_prefix }}/bin/freeswitch"
+        executable: /bin/bash
+      timeout: 3600
+
+- name: Create the freeswitch group
+  ansible.builtin.group:
+    name: freeswitch
+    system: true
+
+- name: Create the freeswitch user
+  ansible.builtin.user:
+    name: freeswitch
+    group: freeswitch
+    system: true
+    home: "{{ freeswitch_prefix }}"
+    shell: /usr/sbin/nologin
+    create_home: false
+
+- name: Install the vanilla config tree if absent
+  ansible.builtin.shell: |
+    set -e
+    mkdir -p {{ freeswitch_conf }}
+    cp -r /usr/src/freeswitch/conf/vanilla/* {{ freeswitch_conf }}/
+  args:
+    creates: "{{ freeswitch_conf }}/freeswitch.xml"
+    executable: /bin/bash
+
+########################################################
+# Core concurrency limits, edited in place.
+#
+# switch.conf.xml is NOT templated, deliberately: it is a large vanilla file
+# with no opinion of ours beyond these two values, and copying it into the repo
+# would mean owning every unrelated default across FreeSWITCH upgrades.
+#
+# The vanilla values are max-sessions 1000 / sessions-per-second 30, and nobody
+# chooses those — they are simply what is there when no one looks. 30 calls per
+# second refuses setup during an ordinary burst, and the refusal reads as a
+# carrier problem.
+########################################################
+- name: Raise the core concurrency limits
+  ansible.builtin.replace:
+    path: "{{ freeswitch_conf }}/autoload_configs/switch.conf.xml"
+    regexp: '(<param\s+name="{{ item.name }}"\s+value=")[^"]*(")'
+    replace: '\g<1>{{ item.value }}\g<2>'
+  loop:
+    - { name: "max-sessions", value: "{{ freeswitch_max_sessions }}" }
+    - { name: "sessions-per-second", value: "{{ freeswitch_sessions_per_second }}" }
+    - { name: "rtp-start-port", value: "{{ freeswitch_rtp_port_min }}" }
+    - { name: "rtp-end-port", value: "{{ freeswitch_rtp_port_max }}" }
+  loop_control:
+    label: "{{ item.name }}={{ item.value }}"
+  notify: restart freeswitch
+
+# A regex substitution that matches nothing is a SILENT no-op, and these are the
+# concurrency ceiling for the whole node. A quiet failure means discovering the
+# box is still capped at the vanilla 1000 during the event it was raised for —
+# so the file is read back and the result asserted.
+- name: Read back switch.conf.xml
+  ansible.builtin.slurp:
+    src: "{{ freeswitch_conf }}/autoload_configs/switch.conf.xml"
+  register: switch_conf
+  changed_when: false
+
+- name: Fail if the concurrency limits did not land
+  ansible.builtin.assert:
+    that:
+      - (switch_conf.content | b64decode) is search('name="max-sessions"\s+value="' ~ freeswitch_max_sessions ~ '"')
+      - (switch_conf.content | b64decode) is search('name="sessions-per-second"\s+value="' ~ freeswitch_sessions_per_second ~ '"')
+    fail_msg: >-
+      max-sessions and/or sessions-per-second were NOT set in switch.conf.xml.
+      The param is missing, commented out, or formatted differently from what
+      the regexp expects. FreeSWITCH is still running the vanilla 1000 / 30.
+    success_msg: >-
+      switch.conf.xml carries max-sessions={{ freeswitch_max_sessions }},
+      sessions-per-second={{ freeswitch_sessions_per_second }}
+
+########################################################
+# Vanilla vars.xml resolves external_sip_ip and external_rtp_ip via STUN
+# against stun.freeswitch.org, and X-PRE-PROCESS runs that lookup at config
+# parse whether or not any profile uses the result.
+#
+# That is a third-party dependency in the startup path of a box with NO public
+# networking. If the STUN server is slow or unreachable, FreeSWITCH start is
+# delayed for an address nothing here needs.
+#
+# Pinned to the private address rather than deleted, so that a vanilla upgrade
+# reintroducing the stun: form is simply re-pinned by this task.
+########################################################
+- name: Pin the external IP vars (no STUN at boot)
+  ansible.builtin.replace:
+    path: "{{ freeswitch_conf }}/vars.xml"
+    regexp: 'data="external_(rtp|sip)_ip=stun:[^"]*"'
+    replace: 'data="external_\1_ip={{ ansible_host }}"'
+  notify: restart freeswitch
+
+########################################################
+# Remove the vanilla profiles nothing uses.
+#
+# Each one still binds a port, runs its own thread set, and maintains its own
+# sofia registration database — writes into the same sqlite that serves
+# `show channels`. An unmanaged listener advertising an address it cannot be
+# contacted on is not something to leave running into a capacity event.
+#
+# Removing `external` also removes the vanilla example.com gateway, which sits
+# permanently NOREG and shows up in every gateway status check as a failure
+# that is not one.
+########################################################
+- name: Remove the unused vanilla SIP profiles
+  ansible.builtin.file:
+    path: "{{ freeswitch_conf }}/sip_profiles/{{ item }}"
+    state: absent
+  loop:
+    - external.xml
+    - external-ipv6.xml
+    - internal-ipv6.xml
+  notify: restart freeswitch
+
+- name: Deploy the internal SIP profile
+  ansible.builtin.template:
+    src: internal.xml.j2
+    dest: "{{ freeswitch_conf }}/sip_profiles/internal.xml"
+    owner: freeswitch
+    group: freeswitch
+    mode: "0640"
+  notify: restart freeswitch
+
+# Carries the ESL password, so it is deployed as a .tpl and substituted from
+# Secrets Manager at service start. The rendered .xml never exists in this
+# repository and never transits Ansible's S3 transport bucket.
+- name: Deploy modules.conf.xml (controls what gets loaded)
+  ansible.builtin.template:
+    src: modules.conf.xml.j2
+    dest: "{{ freeswitch_conf }}/autoload_configs/modules.conf.xml"
+    owner: freeswitch
+    group: freeswitch
+    mode: "0640"
+  notify: restart freeswitch
+
+########################################################
+# The ACL the event socket applies. NOT optional.
+#
+# mod_event_socket installs `loopback.auto` for itself when no
+# apply-inbound-acl is set, so there is no configuration in which the ESL port
+# has no ACL — only ones where the ACL is this list or is loopback-only. This
+# must land before event_socket.conf.xml references it.
+#
+# Read at module load, so a change needs a restart; reloadxml does not pick it
+# up, and appears to succeed.
+########################################################
+- name: Deploy the network ACLs
+  ansible.builtin.template:
+    src: acl.conf.xml.j2
+    dest: "{{ freeswitch_conf }}/autoload_configs/acl.conf.xml"
+    owner: freeswitch
+    group: freeswitch
+    mode: "0640"
+  notify: restart freeswitch
+
+- name: Deploy the event socket configuration template
+  ansible.builtin.template:
+    src: event_socket.conf.xml.tpl.j2
+    dest: "{{ freeswitch_conf }}/autoload_configs/event_socket.conf.xml.tpl"
+    owner: freeswitch
+    group: freeswitch
+    mode: "0640"
+  notify: restart freeswitch
+
+########################################################
+# fs_cli credentials, written at every service start by the unit's
+# ExecStartPre (see freeswitch.service.j2).
+#
+# Without this, fs_cli on the box has neither the ESL password nor the right
+# host — it defaults to 127.0.0.1 and `ClueCon`, and this node binds the event
+# socket to its private address with a generated password. So every fs_cli
+# call fails with `Error Connecting []`, which names neither cause. That
+# breaks the `reload freeswitch xml` handler, the unit's ExecReload, and
+# interactive debugging.
+########################################################
+- name: Install the fs_cli credential renderer
+  ansible.builtin.copy:
+    src: render-fs-cli-conf.sh
+    dest: /usr/local/bin/render-fs-cli-conf.sh
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart freeswitch
+
+- name: Deploy the public dialplan
+  ansible.builtin.template:
+    src: dialplan-public.xml.j2
+    dest: "{{ freeswitch_conf }}/dialplan/public.xml"
+    owner: freeswitch
+    group: freeswitch
+    mode: "0640"
+  notify: reload freeswitch xml
+
+- name: Create the runtime directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: freeswitch
+    group: freeswitch
+    mode: "0755"
+  loop:
+    - "{{ freeswitch_prefix }}/var/run/freeswitch"
+    - "{{ freeswitch_prefix }}/var/log/freeswitch"
+    - "{{ freeswitch_prefix }}/var/lib/freeswitch/db"
+    - "{{ freeswitch_recording_path }}"
+
+- name: Set ownership on the FreeSWITCH prefix
+  ansible.builtin.file:
+    path: "{{ freeswitch_prefix }}"
+    state: directory
+    owner: freeswitch
+    group: freeswitch
+    recurse: true
+
+- name: Allow realtime scheduling for the freeswitch user
+  # Media threads need to run ahead of everything else on the box. Without
+  # these limits FreeSWITCH logs a warning at start and runs at normal
+  # priority — which shows up as jitter under load rather than as an error.
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/freeswitch.conf
+    mode: "0644"
+    content: |
+      freeswitch  soft  rtprio   99
+      freeswitch  hard  rtprio   99
+      freeswitch  soft  nice    -20
+      freeswitch  hard  nice    -20
+      freeswitch  soft  nofile   65536
+      freeswitch  hard  nofile   65536
+      freeswitch  soft  memlock  unlimited
+      freeswitch  hard  memlock  unlimited
+
+- name: Deploy the systemd unit
+  ansible.builtin.template:
+    src: freeswitch.service.j2
+    dest: /etc/systemd/system/freeswitch.service
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart freeswitch
+
+- name: Flush handlers before verification
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start FreeSWITCH
+  ansible.builtin.systemd:
+    name: freeswitch
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Verify FreeSWITCH is listening for SIP
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ freeswitch_sip_port }}"
+    timeout: 60
+
+########################################################
+# Assert the modules the platform depends on were actually built.
+#
+# modules.conf asked for these; this confirms the build delivered them. A
+# module can be requested and still not built - configure silently drops one
+# whose dependency is missing, which is how an absent mod_event_socket would
+# otherwise go unnoticed until a test call.
+#
+# mod_event_socket IS the control-plane integration. Without it FreeSWITCH
+# starts cleanly, answers calls, and never reaches the controller.
+#
+# Checked rather than assumed because the build takes ~30 minutes, and the
+# symptom otherwise shows up much later as calls that answer and immediately
+# end.
+########################################################
+- name: Check the required modules were built
+  ansible.builtin.stat:
+    path: "{{ freeswitch_prefix }}/lib/freeswitch/mod/{{ item }}.so"
+  loop: "{{ freeswitch_modules | map('basename') | list }}"
+  register: freeswitch_module_stat
+  changed_when: false
+
+- name: Fail if a required module is missing
+  ansible.builtin.assert:
+    that: freeswitch_module_stat.results | rejectattr('stat.exists') | list | length == 0
+    fail_msg: >-
+      Missing module(s):
+      {{ freeswitch_module_stat.results | rejectattr('stat.exists') | map(attribute='item') | list | join(', ') }}.
+      They are in freeswitch_modules, so modules.conf asked for them and the
+      build did not produce them — check the configure output for a missing
+      dependency. Remove {{ freeswitch_prefix }}/bin/freeswitch to force a
+      rebuild after fixing it.
+    success_msg: "All {{ freeswitch_modules | length }} modules built"
+
+########################################################
+# Prove the ESL controller is reachable from this node.
+#
+# The single most consequential dependency FreeSWITCH has, and the one with the
+# worst failure mode: if the &socket() target does not resolve or does not
+# accept, EVERY inbound call is dropped at answer with nothing in the
+# controller's log — because the controller was never reached.
+#
+# GATED, because of a bootstrap ordering problem. The controller runs a
+# container that does not exist until the backend services are built and
+# pushed, so on a first pass there is nothing listening and this fails at the
+# very end of a ~30 minute build.
+#
+# Pass `-e verify_esl_target=false` for that first run, or
+# `--skip-tags verify-esl`. Turn it back on afterwards — it is what catches a
+# stale target later, which is the case that actually costs calls.
+########################################################
+- name: Verify the ESL controller target resolves and accepts
+  when: verify_esl_target | bool
+  tags: [verify-esl]
+  block:
+    - name: Probe the ESL controller target
+      ansible.builtin.wait_for:
+        host: "{{ freeswitch_esl_outbound_target.split(':')[0] }}"
+        port: "{{ freeswitch_esl_outbound_target.split(':')[1] | int }}"
+        timeout: 30
+      register: esl_reachable
+      failed_when: false
+
+    - name: Fail with the actual cause if the ESL controller is unreachable
+      ansible.builtin.fail:
+        msg: >-
+          Cannot reach {{ freeswitch_esl_outbound_target }} from
+          {{ inventory_hostname }}. Every inbound call will be dropped at answer
+          with nothing logged on the controller side. Check, in this order:
+          (1) is the control-plane container actually running? There is no load
+          balancer — this resolves straight to the app instance, so a refused
+          connection means nothing is listening;
+          (2) freeswitch_esl_outbound_target in group_vars/all.yml matches
+          `make output STACK=control-plane ENV={{ env_name }} EXTRA="-raw esl_target"`;
+          (3) the app security group admits the FreeSWITCH security group on
+          {{ freeswitch_esl_outbound_target.split(':')[1] }}.
+          A TIMEOUT points at (3); CONNECTION REFUSED points at (1).
+      when: esl_reachable is failed

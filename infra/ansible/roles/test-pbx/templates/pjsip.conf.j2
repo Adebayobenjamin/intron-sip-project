@@ -1,0 +1,162 @@
+{{ ansible_managed | comment }}
+;
+; Asterisk PJSIP config for the disposable test PBX.
+;
+; Two endpoints and nothing else:
+;   intron   the Intron edge, IP-authenticated, sends us handoff calls
+;   agent    a Linphone softphone, password-authenticated, answers them
+
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0:{{ test_pbx_sip_port }}
+;
+; THE SAME AWS TRAP AS KAMAILIO AND RTPENGINE, and it bites here for exactly
+; the same reason. AWS maps the Elastic IP 1:1 at the VPC edge; this instance
+; holds only {{ ansible_host }} and has no way to discover
+; {{ test_pbx_public_ip }}.
+;
+; Without these two lines Asterisk writes {{ ansible_host }} into its SDP and
+; its Contact header. The far end - RTPEngine on the Intron edge, reached over
+; the public internet - cannot route there. THE CALL SETS UP PERFECTLY, both
+; sides answer, and there is no audio in either direction.
+;
+; Value comes from Terraform (test_pbx_public_ip) through the inventory.
+external_media_address={{ test_pbx_public_ip }}
+external_signaling_address={{ test_pbx_public_ip }}
+;
+; The VPC range is local, so Asterisk does not apply the external addresses to
+; traffic that genuinely stays inside it - Ansible's own SSM-driven checks, for
+; instance.
+local_net={{ vpc_cidr }}
+
+;=======================================================
+; TCP TRANSPORT — FOR THE AGENT'S SOFTPHONE, NOT FOR THE EDGE.
+;
+; Added because UDP 5060 never arrives from the operator's network. Proven,
+; not guessed: a packet capture on this box recorded other UDP traffic during
+; the same window while three probes sent to 5060 from the operator's machine
+; produced ZERO packets, from any port. The drop is upstream of this instance.
+;
+; That is ordinary on consumer and mobile ISPs - SIP on 5060/udp is blocked to
+; protect the carrier's own voice product, or a CPE SIP ALG swallows it. TCP on
+; the same port usually passes, because the ALG is looking for UDP SIP and a
+; blanket block is more often written for UDP.
+;
+; THE EDGE STILL USES UDP. Its INVITEs arrive from inside AWS over a path with
+; no consumer CPE on it, and they work. This transport exists for one
+; registering softphone; it is not a change to how handoff calls travel.
+;
+; If TCP is blocked too, the next step is TLS on 5061 - indistinguishable from
+; HTTPS to a middlebox - which needs a certificate and is more work.
+;=======================================================
+[transport-tcp]
+type=transport
+protocol=tcp
+bind=0.0.0.0:{{ test_pbx_sip_port }}
+; The same reason as the UDP transport above: this box holds only
+; {{ ansible_host }} and cannot discover {{ test_pbx_public_ip }}. Omitting
+; these here would make TCP registration succeed and then put a private
+; address in the SDP, which is the no-audio failure arriving by a new route.
+external_media_address={{ test_pbx_public_ip }}
+external_signaling_address={{ test_pbx_public_ip }}
+local_net={{ vpc_cidr }}
+
+;=======================================================
+; THE INTRON EDGE
+;
+; IP-authenticated: it sends us INVITEs and never registers, which is how a
+; carrier or a peer SBC behaves. The `identify` section below is what maps the
+; source address to this endpoint - without it Asterisk cannot tell who is
+; calling and answers with a 401 challenge that Kamailio will not satisfy.
+;=======================================================
+[intron]
+type=endpoint
+context=from-intron
+disallow=all
+{% for codec in test_pbx_codecs %}
+allow={{ codec }}
+{% endfor %}
+;
+; direct_media=no keeps Asterisk in the media path. With it on, Asterisk tries
+; to get the two ends talking to each other directly - which cannot work when
+; one of them is RTPEngine behind a NAT boundary and the other is a softphone
+; behind a domestic router.
+direct_media=no
+;
+; Trust nothing about who the caller claims to be. This is a test rig on a
+; public address; the only thing that makes it safe is that the only source
+; allowed to reach 5060 is the edge's /32.
+trust_id_inbound=no
+
+[intron]
+type=identify
+endpoint=intron
+;
+; THE EDGE'S PUBLIC ADDRESS, not its private one. Traffic arrives here over
+; the internet gateway, so that is the source Asterisk sees. Using the private
+; address would mean no match, and the call would be challenged for auth it
+; cannot provide.
+match={{ intron_edge_public_ip }}
+
+;=======================================================
+; THE AGENT — a Linphone softphone
+;=======================================================
+[{{ test_pbx_agent_extension }}]
+type=endpoint
+context=from-agent
+disallow=all
+{% for codec in test_pbx_codecs %}
+allow={{ codec }}
+{% endfor %}
+auth={{ test_pbx_agent_extension }}-auth
+aors={{ test_pbx_agent_extension }}
+direct_media=no
+;
+; Linphone is typically behind a domestic NAT, so Asterisk has to reply to
+; where the packets actually came from rather than to whatever the phone put
+; in its Contact header.
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[{{ test_pbx_agent_extension }}-auth]
+type=auth
+auth_type=userpass
+username={{ test_pbx_agent_extension }}
+; Rendered by Ansible from the inventory, NOT fetched from Secrets Manager at
+; service start the way the platform tiers do theirs. The trade is deliberate:
+; this box is rotated by destroying it.
+password={{ test_pbx_agent_password }}
+
+[{{ test_pbx_agent_extension }}]
+type=aor
+max_contacts=1
+;
+; QUALIFY, AND IT IS NOT JUST A STATUS INDICATOR.
+;
+; Without this the contact shows as "NonQual" with an RTT of nan: Asterisk has
+; a registration on file and no idea whether anything is still behind it.
+;
+; The second effect is the one that matters. The softphone reaches us through
+; a domestic NAT, and that mapping has an idle timeout - commonly 5 to 15
+; minutes, well under a typical re-REGISTER interval. With nothing crossing it
+; in between, the mapping expires while the registration is still valid, and
+; the contact keeps listing as present. The first handoff after that fails,
+; and `pjsip show contacts` shows a contact that looks fine.
+;
+; Qualifying every {{ test_pbx_qualify_seconds }}s sends an OPTIONS over the
+; same path, which both reports real reachability and keeps the mapping open.
+; Cheap for one endpoint; do not copy this interval onto a fleet.
+qualify_frequency={{ test_pbx_qualify_seconds }}
+;
+; How long to wait for the OPTIONS reply before calling the contact
+; unreachable. Generous because the path crosses the public internet from
+; Frankfurt to a consumer connection in Lagos - a tight timeout would flap the
+; contact between Avail and Unavail on ordinary jitter.
+qualify_timeout=5.0
+;
+; One phone, one registration. remove_existing means a re-register from a new
+; address replaces the old contact rather than adding a second one and forking
+; the call to a device that is no longer there.
+remove_existing=yes

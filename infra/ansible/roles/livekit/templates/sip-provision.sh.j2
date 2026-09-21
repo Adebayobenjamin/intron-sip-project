@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+{{ ansible_managed | comment }}
+#
+# =============================================================================
+# Provision the LiveKit inbound trunk and dispatch rule.
+#
+# THESE ARE API OBJECTS, NOT CONFIG FILES. They live inside LiveKit, closer to
+# database rows than to livekit.yaml, which is why they cannot simply be
+# templated onto disk. Without them an INVITE reaching livekit-sip has no room
+# to land in and the call is rejected — this is precisely what Intron's own
+# deployment lacks, and why it has never accepted an inbound call.
+#
+# Idempotent: it looks for objects by name and creates only what is missing.
+# Safe to run on every play.
+#
+# Re-runnable by hand:  {{ livekit_config_root }}/sip-provision.sh
+# =============================================================================
+
+set -euo pipefail
+
+LK=/usr/local/bin/lk
+CONF={{ livekit_config_root }}
+
+# The lk CLI reads a config file under $HOME and refuses to start without it
+# being set, with "$HOME is not defined". Ansible provides one; a bare SSM
+# session does not, and this script is meant to be re-runnable by hand from
+# either. Set it rather than depend on the caller.
+export HOME="${HOME:-/root}"
+TRUNK_NAME='{{ livekit_sip_trunk_name }}'
+RULE_NAME='{{ livekit_sip_dispatch_rule_name }}'
+
+# Credentials come from Secrets Manager via the instance profile, exactly as
+# the services get them — never from Ansible, so nothing resolved transits the
+# control node or the S3 transport bucket.
+secret_json=$(aws secretsmanager get-secret-value \
+  --region "{{ aws_region }}" \
+  --secret-id "{{ livekit_secret_id }}" \
+  --query SecretString --output text)
+
+LIVEKIT_API_KEY=$(jq -r '.LIVEKIT_API_KEY' <<<"$secret_json")
+LIVEKIT_API_SECRET=$(jq -r '.LIVEKIT_API_SECRET' <<<"$secret_json")
+export LIVEKIT_API_KEY LIVEKIT_API_SECRET
+export LIVEKIT_URL="http://localhost:{{ livekit_api_port }}"
+
+[[ -n "$LIVEKIT_API_KEY" && "$LIVEKIT_API_KEY" != "null" ]] \
+  || { echo "provision: {{ livekit_secret_id }} has no LIVEKIT_API_KEY — has it been populated?" >&2; exit 2; }
+
+# -----------------------------------------------------------------------------
+# Inbound trunk.
+#
+# allowed_addresses is the admission control for this trunk: only our Kamailio
+# edge may present calls on it. The security group already restricts who can
+# reach port {{ livekit_sip_listen_port }}, so this is the second of two locks
+# rather than the only one — worth having because the SG rule is written
+# against a security group and this against an address, and they fail
+# independently.
+#
+# No numbers[] filter. Which DIDs are ours is decided by the controller
+# against Postgres long before the B-leg is bridged here; duplicating that
+# list would be a second place to add a DID and forget.
+# -----------------------------------------------------------------------------
+if $LK sip inbound list 2>/dev/null | grep -q "$TRUNK_NAME"; then
+  echo "provision: inbound trunk '$TRUNK_NAME' already exists"
+else
+  # WRAPPED IN "trunk". The CLI parses this straight into
+  # CreateSIPInboundTrunkRequest, whose only field is `trunk` - it is NOT the
+  # bare SIPInboundTrunkInfo. A flat object fails with
+  #     could not read request: proto: unknown field "name"
+  # which points at the field rather than at the missing wrapper.
+  #
+  # Field names are snake_case, matching the proto. protojson also accepts
+  # camelCase, but mixing the two in one file is how a typo hides.
+  cat > "$CONF/sip-inbound-trunk.json" <<JSON
+{
+  "trunk": {
+    "name": "$TRUNK_NAME",
+    "allowed_addresses": [{% for cidr in livekit_sip_allowed_addresses %}"{{ cidr }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+  }
+}
+JSON
+  echo "provision: creating inbound trunk '$TRUNK_NAME'"
+  $LK sip inbound create "$CONF/sip-inbound-trunk.json"
+fi
+
+TRUNK_ID=$($LK sip inbound list 2>/dev/null | grep "$TRUNK_NAME" | grep -oE 'ST_[A-Za-z0-9]+' | head -1)
+[[ -n "$TRUNK_ID" ]] || { echo "provision: could not resolve the trunk id after create" >&2; exit 3; }
+echo "provision: trunk id $TRUNK_ID"
+
+# -----------------------------------------------------------------------------
+# Dispatch rule.
+#
+# TWO THINGS HERE ARE LOAD-BEARING AND NEITHER IS OBVIOUS.
+#
+# 1. agents[]. Intron's worker sets agent_name, which DISABLES automatic
+#    dispatch in livekit-agents. Without naming it here the caller gets a room
+#    and no agent — a connected call, in silence, with nothing in any log
+#    saying why.
+#
+# 2. no_randomness. An individual rule appends a random suffix by default.
+#    Their agent parses the room name for the caller's number, so a random
+#    suffix would break that parse silently — SESSION_PHONE_NUMBER becomes
+#    "unknown" and every lookup keyed on the caller misses without erroring.
+#
+# THE ROOM NAME IS A CONTRACT WITH THEIR PYTHON. Their agent does
+# `room_name.split("__")[1]`, so the composed name must contain "__" before
+# the caller's number. The prefix below ends in "_" so that LiveKit's own
+# separator completes the pair.
+#
+# CONFIRM THIS ON THE FIRST REAL CALL. Compare the room name LiveKit logs
+# against SESSION_PHONE_NUMBER in the agent log: if the number is "unknown",
+# the composition differs from the assumption above and only
+# livekit_sip_room_prefix needs changing.
+# -----------------------------------------------------------------------------
+if $LK sip dispatch list 2>/dev/null | grep -q "$RULE_NAME"; then
+  echo "provision: dispatch rule '$RULE_NAME' already exists"
+else
+  # WRAPPED IN "dispatch_rule", with name, trunk_ids, rule and room_config all
+  # NESTED INSIDE IT - the same shape as the trunk above.
+  #
+  # CreateSIPDispatchRuleRequest also has top-level name/trunk_ids/rule fields,
+  # which is the trap: putting them there parses without error and then fails
+  # validation with "missing rule", pointing at the field rather than at the
+  # missing wrapper.
+  #
+  # Confirmed rather than inferred - `lk --curl sip dispatch create` prints the
+  # request it builds from its own flags:
+  #   {"dispatchRule":{"rule":{"dispatchRuleIndividual":{...}},"trunkIds":[...],"name":"..."}}
+  cat > "$CONF/sip-dispatch-rule.json" <<JSON
+{
+  "dispatch_rule": {
+    "name": "$RULE_NAME",
+    "trunk_ids": ["$TRUNK_ID"],
+    "rule": {
+      "dispatch_rule_individual": {
+        "room_prefix": "{{ livekit_sip_room_prefix }}_",
+        "no_randomness": true
+      }
+    },
+    "room_config": {
+      "agents": [{ "agent_name": "{{ livekit_sip_agent_name }}" }]
+    }
+  }
+}
+JSON
+  echo "provision: creating dispatch rule '$RULE_NAME' -> agent {{ livekit_sip_agent_name }}"
+  $LK sip dispatch create "$CONF/sip-dispatch-rule.json"
+fi
+
+echo "provision: done"
+$LK sip inbound list
+$LK sip dispatch list

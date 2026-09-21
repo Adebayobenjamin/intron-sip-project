@@ -1,0 +1,2966 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Intron control plane",
+    "version": "0.1.0",
+    "description": "Configuration and actions for the Intron SIP platform.\n\n**Nothing here is in the path of a call.** The ESL controller carries calls and reads Postgres directly; this API exists so a human or a script can configure the platform and see what it did.\n\n## Authentication\n\nEvery endpoint takes `Authorization: Bearer <key>`. Two kinds of key work:\n\n- **`CONTROL_PLANE_API_TOKEN`** from the environment \u2014 admin, platform-wide. It has to work before any key exists, including for the request that creates the first one.\n- **An API key** from `POST /v1/api-keys` \u2014 scoped to a tenant, revocable, stored as a SHA-256 hash and shown exactly once.\n\n## Tenant scoping\n\nA platform key may name any tenant. A tenant-scoped key **always** gets its own, whatever `tenant_id` says \u2014 that is what stops the query parameter being a cross-tenant read.\n\n`404` covers both \"no such row\" and \"exists but is not yours\", deliberately: answering `403` for the second would confirm it exists.\n\n## Statuses\n\n| | |\n|---|---|\n| `400` | The body is wrong. **Unknown JSON fields are rejected** \u2014 a typo in `recording` would otherwise be silently ignored |\n| `401` | No token, or one that is not recognised |\n| `403` | Authenticated, but not permitted |\n| `409` | The request conflicts with the current state, e.g. deleting a trunk DIDs still use |\n| `429` | The tenant is at its concurrency cap |\n| `501` | Deliberately not implemented, e.g. `sip_password` before credential encryption exists |\n| `502` | An upstream (Twilio) could not be reached |\n"
+  },
+  "servers": [
+    {
+      "url": "http://api.beta.intron.internal:8080",
+      "description": "beta, inside the VPC"
+    },
+    {
+      "url": "http://localhost:8080",
+      "description": "local"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Diagnostics",
+      "description": "What to call when calls are not arriving."
+    },
+    {
+      "name": "Tenants"
+    },
+    {
+      "name": "Plans",
+      "description": "What happens to a call once it is admitted."
+    },
+    {
+      "name": "DIDs",
+      "description": "Numbers. Normalised to E.164 on write."
+    },
+    {
+      "name": "Trunks",
+      "description": "Carriers and client SBCs."
+    },
+    {
+      "name": "Handoff targets",
+      "description": "Where a call goes when it needs a human."
+    },
+    {
+      "name": "Outbound"
+    },
+    {
+      "name": "Calls",
+      "description": "Live and historic."
+    },
+    {
+      "name": "API keys"
+    }
+  ],
+  "paths": {
+    "/v1/route": {
+      "get": {
+        "tags": [
+          "Diagnostics"
+        ],
+        "summary": "Would a call to this number be admitted?",
+        "description": "The first thing to check when a client says calls are not arriving. Answered by the **same code the call path uses** \u2014 a diagnostic with its own reimplementation of the rules is worth nothing on the day the two disagree.\n\nAnswers from this process's cache; the controller's expires independently, so a very recent edit may not have reached a live call yet.",
+        "parameters": [
+          {
+            "name": "did",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "+4930123456"
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A verdict, including a refusal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteVerdict"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "did is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The database was unreachable and nothing was cached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenants": {
+      "get": {
+        "tags": [
+          "Tenants"
+        ],
+        "summary": "List tenants",
+        "description": "A tenant-scoped key sees exactly itself, not the list.",
+        "responses": {
+          "200": {
+            "description": "Tenants",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Tenant"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Tenants"
+        ],
+        "summary": "Create a tenant",
+        "description": "Platform keys only: a tenant-scoped key creating another tenant would be a privilege escalation.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tenant"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenants/{id}": {
+      "patch": {
+        "tags": [
+          "Tenants"
+        ],
+        "summary": "Update a tenant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tenant"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Tenants"
+        ],
+        "summary": "Soft-delete a tenant",
+        "description": "Never a hard delete: call_history references the tenant by id for years, and removing the row would orphan every record of every call it ever made.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/plans": {
+      "get": {
+        "tags": [
+          "Plans"
+        ],
+        "summary": "List plans",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Platform keys may name any tenant. A tenant-scoped key always gets its own, whatever this says."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Plans",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Plan"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Plans"
+        ],
+        "summary": "Create a plan",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Plan"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid, or destination=ai with no agent_identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/plans/{id}": {
+      "patch": {
+        "tags": [
+          "Plans"
+        ],
+        "summary": "Update a plan",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Plan"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Plans"
+        ],
+        "summary": "Soft-delete a plan",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/dids": {
+      "get": {
+        "tags": [
+          "DIDs"
+        ],
+        "summary": "List numbers",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Platform keys may name any tenant. A tenant-scoped key always gets its own, whatever this says."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Numbers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DID"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "DIDs"
+        ],
+        "summary": "Provision a number",
+        "description": "The number is normalised to E.164 on write, so `0049 30 123-456` and `+4930123456` are one row and the unique index means what it says.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DIDCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DID"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid number",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/dids/{id}": {
+      "patch": {
+        "tags": [
+          "DIDs"
+        ],
+        "summary": "Update a number",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DIDPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DID"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "DIDs"
+        ],
+        "summary": "Release a number",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Released"
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/trunks": {
+      "get": {
+        "tags": [
+          "Trunks"
+        ],
+        "summary": "List trunks",
+        "description": "A tenant-scoped list also includes platform-wide trunks, or a tenant appears to have no way out at all.",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Platform keys may name any tenant. A tenant-scoped key always gets its own, whatever this says."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Trunks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Trunk"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Trunks"
+        ],
+        "summary": "Create a trunk",
+        "description": "**A trunk is half an operation.** Its `signalling_cidrs` must also reach `TF_VAR_carrier_sip_cidrs` and be applied, or calls from it are dropped at the security group with nothing logged on the edge. The response carries the missing half in `next_steps`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrunkCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrunkCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "sip_password: credential encryption is not implemented",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/trunks/{id}": {
+      "patch": {
+        "tags": [
+          "Trunks"
+        ],
+        "summary": "Update a trunk",
+        "description": "`type`, `carrier` and `sip_auth_method` are not patchable: changing what kind of trunk a row is, in place, while DIDs point at it, is a migration rather than an edit.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrunkPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Trunk"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "sip_password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Trunks"
+        ],
+        "summary": "Soft-delete a trunk",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "409": {
+            "description": "DIDs still route by this trunk \u2014 repoint them first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/trunks/{id}/drift": {
+      "get": {
+        "tags": [
+          "Diagnostics"
+        ],
+        "summary": "Does Twilio agree with us?",
+        "description": "Four pieces of configuration live in Twilio's console with nothing checking them, and every mismatch fails silently.\n\n| Check | If it is wrong |\n|---|---|\n| `origination_uri` | **No inbound call ever arrives**, and there is nothing to see on our side \u2014 the packet goes wherever Twilio was told |\n| `termination_acl` | Outbound calls refused with 403 |\n| `phone_numbers` | Numbers Twilio routes that we do not know are refused as unknown; numbers we have that Twilio does not are never called |\n| `signalling_cidrs` | Recorded but **not verifiable** \u2014 Twilio publishes these as documentation, not through the API |\n\n**Read only.** Nothing is written back to Twilio.\n\nAlways `200`, even when it finds drift: \"I checked and found problems\" and \"I could not check\" are different answers.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The comparison",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriftReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "This trunk has no twilio_trunk_sid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Twilio credentials are not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Twilio could not be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/handoff-targets": {
+      "get": {
+        "tags": [
+          "Handoff targets"
+        ],
+        "summary": "List targets",
+        "description": "Includes disabled ones \u2014 an operator needs to see one to enable it, while a live call must never be routed to it.",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Platform keys may name any tenant. A tenant-scoped key always gets its own, whatever this says."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Targets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/HandoffTarget"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Handoff targets"
+        ],
+        "summary": "Add a target",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HandoffTargetCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HandoffTarget"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/handoff-targets/{id}": {
+      "patch": {
+        "tags": [
+          "Handoff targets"
+        ],
+        "summary": "Update a target",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HandoffTargetPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HandoffTarget"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Handoff targets"
+        ],
+        "summary": "Remove a target",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/originate": {
+      "post": {
+        "tags": [
+          "Outbound"
+        ],
+        "summary": "Place an outbound call",
+        "description": "Validates, claims a concurrency slot, and **queues** the call. It does not dial: only the ESL controller holds connections to FreeSWITCH, so the handoff is a row claimed with `FOR UPDATE SKIP LOCKED` \u2014 which also means a queued call survives a controller restart.\n\n`202`, not `201`: nothing has been created that you can use and nobody's phone has rung yet.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OriginateCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OriginateRequest"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "from and to are required, in E.164",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The from-DID has no trunk with a SIP host",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The tenant is at its concurrency cap",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/originate/{call_uuid}": {
+      "get": {
+        "tags": [
+          "Outbound"
+        ],
+        "summary": "What happened to a request",
+        "description": "`placed` means dialled, not answered. Whether anyone picked up is in `/v1/call-history`.",
+        "parameters": [
+          {
+            "name": "call_uuid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OriginateRequest"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/calls": {
+      "get": {
+        "tags": [
+          "Calls"
+        ],
+        "summary": "Calls in progress",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Platform keys may name any tenant. A tenant-scoped key always gets its own, whatever this says."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Live calls",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/LiveCall"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/call-history": {
+      "get": {
+        "tags": [
+          "Calls"
+        ],
+        "summary": "Finished calls",
+        "description": "Paged by timestamp, not offset: this table grows constantly, and an offset shifts under a reader between pages \u2014 which shows up as duplicated and skipped rows in an export nobody double-checks.",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Platform keys may name any tenant. A tenant-scoped key always gets its own, whatever this says."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "maximum": 1000
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Pass the oldest invite_at from the previous page."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/HistoricCall"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid limit or before",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api-keys": {
+      "get": {
+        "tags": [
+          "API keys"
+        ],
+        "summary": "List keys",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Platform keys may name any tenant. A tenant-scoped key always gets its own, whatever this says."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/APIKey"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "API keys"
+        ],
+        "summary": "Mint a key",
+        "description": "Admin scope: a write key that could mint another key could mint one with more scope than it has. The token is returned **once**.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/APIKeyCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created; the token is shown once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIKeyCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown scope, or one the caller does not hold",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api-keys/{id}": {
+      "delete": {
+        "tags": [
+          "API keys"
+        ],
+        "summary": "Revoke a key",
+        "description": "A soft revoke: 'which key was that, and when did it stop working' is asked after an incident, and a deleted row cannot answer it.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No or unrecognised token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient scope, or another tenant's resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "An API key from POST /v1/api-keys, or CONTROL_PLANE_API_TOKEN."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "Tenant": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "examples": [
+              "t_acme"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "suspended"
+            ],
+            "description": "A suspended tenant's calls are refused with CALL_REJECTED (SIP 403)."
+          },
+          "concurrency_cap": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Maximum simultaneous calls. Null means no cap \u2014 correct for beta, and the wrong default for a platform wired to carriers."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TenantCreate": {
+        "type": "object",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "suspended"
+            ]
+          },
+          "concurrency_cap": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          }
+        }
+      },
+      "TenantPatch": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "suspended"
+            ]
+          },
+          "concurrency_cap": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "clear_concurrency_cap": {
+            "type": "boolean",
+            "description": "Removes the cap. Sending null for concurrency_cap leaves it unchanged."
+          }
+        }
+      },
+      "Plan": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "examples": [
+              "p_main"
+            ]
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "destination": {
+            "type": "string",
+            "enum": [
+              "ai",
+              "handoff",
+              "reject"
+            ]
+          },
+          "recording": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "PlanCreate": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "destination"
+        ],
+        "description": "The agent settings are FIELDS OF THE PLAN, not a separate resource: a plan routing to `ai` with no agent configured is a call refused pre-answer, so the two go in one request.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "destination": {
+            "type": "string",
+            "enum": [
+              "ai",
+              "handoff",
+              "reject"
+            ]
+          },
+          "recording": {
+            "type": "boolean",
+            "description": "Starts record_session before the bridge. Off by default."
+          },
+          "agent_identity": {
+            "type": "string",
+            "description": "REQUIRED when destination=ai, rejected otherwise."
+          },
+          "room_template": {
+            "type": "string",
+            "default": "{call_uuid}",
+            "description": "Placeholders: {call_uuid} {tenant_id} {plan_id} {did}"
+          }
+        }
+      },
+      "PlanPatch": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "destination": {
+            "type": "string",
+            "enum": [
+              "ai",
+              "handoff",
+              "reject"
+            ]
+          },
+          "recording": {
+            "type": "boolean"
+          },
+          "agent_identity": {
+            "type": "string"
+          },
+          "room_template": {
+            "type": "string"
+          }
+        }
+      },
+      "DID": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "number": {
+            "type": "string",
+            "examples": [
+              "+4930123456"
+            ],
+            "description": "Stored normalised to E.164."
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "plan_id": {
+            "type": "string"
+          },
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "DIDCreate": {
+        "type": "object",
+        "required": [
+          "number"
+        ],
+        "properties": {
+          "number": {
+            "type": "string",
+            "examples": [
+              "+4930123456",
+              "0049 30 123-456"
+            ],
+            "description": "Normalised on write with the same function the call path uses, so every shape of a number is one row."
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "plan_id": {
+            "type": "string"
+          },
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          }
+        }
+      },
+      "DIDPatch": {
+        "type": "object",
+        "properties": {
+          "plan_id": {
+            "type": "string"
+          },
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          }
+        }
+      },
+      "Trunk": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tenant_id": {
+            "type": "string",
+            "description": "Absent means platform-wide: the shared carrier every tenant leaves by."
+          },
+          "slug": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "inbound",
+              "outbound",
+              "bi_directional"
+            ]
+          },
+          "carrier": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "sip_host": {
+            "type": "string"
+          },
+          "sip_port": {
+            "type": "integer"
+          },
+          "sip_username": {
+            "type": "string"
+          },
+          "sip_auth_method": {
+            "type": "string",
+            "enum": [
+              "ip_whitelisting",
+              "registration"
+            ]
+          },
+          "has_password": {
+            "type": "boolean",
+            "description": "The credential itself is never returned."
+          },
+          "signalling_cidrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "MUST also be in TF_VAR_carrier_sip_cidrs and applied, or inbound packets are dropped at the security group with nothing logged on the edge."
+          },
+          "media_cidrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "channel_size": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "caller_id_format": {
+            "type": "string"
+          },
+          "twilio_trunk_sid": {
+            "type": "string",
+            "description": "Links this row to Twilio, for drift detection."
+          },
+          "health_status": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TrunkCreate": {
+        "type": "object",
+        "required": [
+          "slug",
+          "name",
+          "carrier",
+          "type",
+          "sip_auth_method"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "inbound",
+              "outbound",
+              "bi_directional"
+            ]
+          },
+          "carrier": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "sip_host": {
+            "type": "string"
+          },
+          "sip_port": {
+            "type": "integer"
+          },
+          "sip_username": {
+            "type": "string"
+          },
+          "sip_password": {
+            "type": "string",
+            "description": "REFUSED with 501: credential encryption is not implemented. Accepting it would either store a carrier credential in the clear or silently drop it."
+          },
+          "sip_auth_method": {
+            "type": "string",
+            "enum": [
+              "ip_whitelisting",
+              "registration"
+            ]
+          },
+          "signalling_cidrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "media_cidrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "channel_size": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "caller_id_format": {
+            "type": "string"
+          },
+          "twilio_trunk_sid": {
+            "type": "string",
+            "examples": [
+              "TK32a3c49700594992af..."
+            ]
+          }
+        }
+      },
+      "TrunkCreated": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Trunk"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "next_steps": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "A trunk is HALF an operation \u2014 the other half is Terraform, and nothing enforces the pair."
+              }
+            }
+          }
+        ]
+      },
+      "TrunkPatch": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "sip_host": {
+            "type": "string"
+          },
+          "sip_port": {
+            "type": "integer"
+          },
+          "signalling_cidrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "media_cidrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "channel_size": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "clear_channel_size": {
+            "type": "boolean"
+          },
+          "twilio_trunk_sid": {
+            "type": "string"
+          }
+        }
+      },
+      "HandoffTarget": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "sip_uri",
+              "e164"
+            ]
+          },
+          "destination": {
+            "type": "string",
+            "examples": [
+              "sip:queue@sbc.client.example",
+              "+442071234567"
+            ]
+          },
+          "priority": {
+            "type": "integer",
+            "default": 100,
+            "description": "Failover order, lowest first."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "HandoffTargetCreate": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "destination"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "sip_uri",
+              "e164"
+            ],
+            "description": "An e164 target leaves by the tenant's default trunk; a sip_uri carries its own host."
+          },
+          "destination": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "HandoffTargetPatch": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "sip_uri",
+              "e164"
+            ]
+          },
+          "destination": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "RouteVerdict": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string"
+          },
+          "admitted": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unknown_did",
+              "did_inactive",
+              "no_plan",
+              "plan_inactive",
+              "tenant_suspended",
+              "plan_rejects",
+              "over_capacity",
+              "lookup_failed"
+            ]
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "plan_id": {
+            "type": "string"
+          },
+          "destination": {
+            "type": "string"
+          },
+          "recording": {
+            "type": "boolean"
+          },
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "Answered from an expired cache entry because the database was unreachable."
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      },
+      "DriftReport": {
+        "type": "object",
+        "properties": {
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "twilio_trunk_sid": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "enum": [
+                    "origination_uri",
+                    "termination_acl",
+                    "phone_numbers",
+                    "signalling_cidrs"
+                  ]
+                },
+                "ok": {
+                  "type": "boolean"
+                },
+                "detail": {
+                  "type": "string"
+                },
+                "expected": {},
+                "actual": {}
+              }
+            }
+          }
+        }
+      },
+      "OriginateRequest": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "call_uuid": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "plan_id": {
+            "type": "string"
+          },
+          "from_did": {
+            "type": "string"
+          },
+          "to_number": {
+            "type": "string"
+          },
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "claimed",
+              "placed",
+              "failed"
+            ],
+            "description": "`placed` means DIALLED, not answered. Whether anyone picked up is in /v1/call-history."
+          },
+          "claimed_by": {
+            "type": "string"
+          },
+          "claimed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "error": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      },
+      "OriginateCreate": {
+        "type": "object",
+        "required": [
+          "from",
+          "to"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": "string"
+          },
+          "from": {
+            "type": "string",
+            "examples": [
+              "+4930123456"
+            ],
+            "description": "MUST be an active DID this tenant owns. One lookup settles three things: authorisation, the caller ID presented, and the trunk the call leaves by."
+          },
+          "to": {
+            "type": "string",
+            "examples": [
+              "+2348012345678"
+            ]
+          },
+          "plan_id": {
+            "type": "string",
+            "description": "What to do once the customer answers. Defaults to the AI leg."
+          }
+        }
+      },
+      "LiveCall": {
+        "type": "object",
+        "properties": {
+          "call_uuid": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "plan_id": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "inbound",
+              "outbound"
+            ]
+          },
+          "did": {
+            "type": "string"
+          },
+          "caller": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "ringing",
+              "answered",
+              "bridged",
+              "handoff"
+            ]
+          },
+          "node": {
+            "type": "string"
+          },
+          "livekit_room": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "answered_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "heartbeat_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "A claim that stops beating for five minutes is swept, so a crashed controller does not permanently reduce a tenant's capacity."
+          }
+        }
+      },
+      "HistoricCall": {
+        "type": "object",
+        "properties": {
+          "call_uuid": {
+            "type": "string"
+          },
+          "sip_call_id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string"
+          },
+          "did": {
+            "type": "string"
+          },
+          "caller": {
+            "type": "string"
+          },
+          "callee": {
+            "type": "string"
+          },
+          "plan_id": {
+            "type": "string"
+          },
+          "livekit_room": {
+            "type": "string"
+          },
+          "invite_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "answer_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "end_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "talk_seconds": {
+            "type": "integer"
+          },
+          "sip_code": {
+            "type": "integer"
+          },
+          "hangup_cause": {
+            "type": "string",
+            "examples": [
+              "NORMAL_CLEARING",
+              "UNALLOCATED_NUMBER"
+            ]
+          },
+          "hangup_by": {
+            "type": "string",
+            "enum": [
+              "caller",
+              "callee",
+              "platform",
+              ""
+            ],
+            "description": "Read off CHANNEL_HANGUP_COMPLETE. Empty when nothing reported it \u2014 a missing attribution beats a wrong one."
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "recording_url": {
+            "type": "string"
+          }
+        }
+      },
+      "APIKey": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "read",
+                "write",
+                "admin"
+              ]
+            }
+          },
+          "last_used_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "APIKeyCreated": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/APIKey"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "token": {
+                "type": "string",
+                "description": "Shown ONCE. Only a SHA-256 hash is stored; a lost key is replaced, not recovered."
+              },
+              "note": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "APIKeyCreate": {
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string",
+            "description": "Required: 'which key is this and can I revoke it' is the only question ever asked of this table."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "read",
+                "write",
+                "admin"
+              ]
+            },
+            "default": [
+              "read"
+            ],
+            "description": "A key cannot be issued with a scope its creator does not hold."
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,31 @@
+---
+rtpengine_ng_port: 2223
+rtpengine_listen_ng: "127.0.0.1:2223"
+rtpengine_port_min: 30000
+rtpengine_port_max: 40000
+rtpengine_kernel_module: true
+rtpengine_table: 0
+rtpengine_jitter_buffer: 10
+rtpengine_log_level: 6
+rtpengine_num_threads: "{{ ansible_processor_vcpus }}"
+
+# Debian's own packages, which drop the "ngcp-" prefix the upstream/Sipwise
+# builds use. Getting this wrong fails with "No package matching
+# 'ngcp-rtpengine-daemon' is available" while the package sits in bookworm main
+# under the name below.
+#
+# The dfx.at repository carries newer builds, but it is a third-party mirror in
+# the install path of the box that carries all media — take it only when a
+# specific fix is needed, and know that its kernel module has to match the
+# running kernel just the same.
+rtpengine_packages:
+  - rtpengine-daemon
+  - rtpengine-iptables
+
+# Split out from the above because it is conditional on rtpengine_kernel_module
+# and because the headers must match the RUNNING kernel — not whatever is
+# newest in the archive. Installing the dkms package without them builds
+# nothing, silently.
+rtpengine_kernel_packages:
+  - rtpengine-kernel-dkms
+  - "linux-headers-{{ ansible_facts['kernel'] }}"

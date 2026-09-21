@@ -1,0 +1,315 @@
+---
+########################################################
+# LiveKit server.
+#
+# Order matters once: the config has to be on disk before the unit starts, and
+# the unit renders secrets into that config at start. Everything else is
+# ordinary.
+########################################################
+
+########################################################
+# Assert the names are configured before doing anything.
+#
+# A placeholder here would deploy cleanly and fail at certificate issuance,
+# twenty minutes later, with an ACME error naming a domain nobody recognises.
+# Cheaper to stop now.
+########################################################
+- name: Assert the public names are set
+  ansible.builtin.assert:
+    that:
+      - livekit_fqdn is defined
+      - livekit_fqdn | length > 0
+      - livekit_fqdn is not match('REPLACE_ME')
+      - livekit_turn_fqdn is defined
+      - livekit_turn_fqdn | length > 0
+      - livekit_turn_fqdn is not match('REPLACE_ME')
+    fail_msg: >-
+      livekit_fqdn / livekit_turn_fqdn are not set in
+      inventories/{{ env_name }}/group_vars/livekit.yml. Take them from the
+      stack: cd infra/iac && make output STACK=livekit ENV={{ env_name }}
+      EXTRA="-raw livekit_fqdn"
+
+########################################################
+# THE DELEGATION CHECK.
+#
+# Creating the Route53 zone does not make the name resolve - the parent domain
+# has to delegate to it with NS records, and that step is manual and external.
+# Until it happens Caddy cannot complete the ACME HTTP-01 challenge, and the
+# error it reports is about the certificate, which sends people to look at
+# Caddy, TLS, and the security group before DNS.
+#
+# Resolved from the TARGET, not from the laptop running this play, because the
+# box is what has to reach Let's Encrypt and be reached back.
+#
+# Not a hard failure: the play can legitimately run before delegation while
+# bringing the box up. The unit will restart-loop until DNS is right, which is
+# recoverable, and this warning is what tells you why.
+########################################################
+- name: Check the public name resolves
+  ansible.builtin.command: "getent hosts {{ livekit_fqdn }}"
+  register: livekit_dns_check
+  changed_when: false
+  failed_when: false
+
+- name: Warn if the name does not resolve yet
+  ansible.builtin.debug:
+    msg: >-
+      {{ livekit_fqdn }} does not resolve from this host. The NS delegation
+      from the parent domain is missing or has not propagated. Caddy will not
+      get a certificate and the unit will restart-loop until it does. Check
+      with: dig +short NS {{ livekit_fqdn.split('.')[1:] | join('.') }} @1.1.1.1
+      and compare against `make output STACK=livekit ENV={{ env_name }}
+      EXTRA="livekit_zone_nameservers"`.
+  when: livekit_dns_check.rc != 0
+
+########################################################
+# Config directories.
+#
+# 0750 root:root. The rendered livekit.yaml contains the API secret, and this
+# box has no unprivileged service account that needs to read it - the
+# containers run as root inside their own namespaces and bind-mount the file.
+########################################################
+- name: Create the config root
+  ansible.builtin.file:
+    path: "{{ livekit_config_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Create the persistent data directories
+  ansible.builtin.file:
+    path: "{{ livekit_config_root }}/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop:
+    # Caddy's ACME account and certificate store. Losing it means re-issuing,
+    # which is fine once and rate-limited if it happens five times in a week.
+    - caddy_data
+    # Redis's append-only file. THIS IS THE DEPLOYMENT'S ONLY DURABLE STATE:
+    # the SIP inbound trunk and dispatch rule live in Redis, with no database
+    # behind them. Losing this directory means inbound calls are rejected
+    # until the play runs again and recreates them with new ids.
+    - redis
+
+########################################################
+# The config that carries the secret ships as .tpl.
+#
+# fetch-and-render-secrets.sh substitutes ${LIVEKIT_API_KEY} and
+# ${LIVEKIT_API_SECRET} on the box at every service start. Nothing resolved is
+# written by Ansible, so no secret transits the S3 transport bucket, lands in
+# this repository, or appears in a play's diff.
+########################################################
+- name: Deploy the LiveKit config template
+  ansible.builtin.template:
+    src: livekit.yaml.tpl.j2
+    dest: "{{ livekit_config_root }}/livekit.yaml.tpl"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: restart livekit
+
+########################################################
+# Caddy needs no credentials, so it ships rendered.
+########################################################
+- name: Deploy the Caddy config
+  ansible.builtin.template:
+    src: caddy.yaml.j2
+    dest: "{{ livekit_config_root }}/caddy.yaml"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: restart livekit
+
+########################################################
+# livekit-sip config, also carrying the API credentials, so also a .tpl.
+#
+# Deployed even when SIP is disabled: the file is harmless without the
+# container, and its absence on a later enable is a restart loop rather than
+# an error.
+########################################################
+- name: Deploy the livekit-sip config template
+  ansible.builtin.template:
+    src: sip.yaml.tpl.j2
+    dest: "{{ livekit_config_root }}/sip.yaml.tpl"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: restart livekit
+
+- name: Deploy the compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ livekit_config_root }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: restart livekit
+
+- name: Deploy the systemd unit
+  ansible.builtin.template:
+    src: livekit.service.j2
+    dest: /etc/systemd/system/intron-livekit.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart livekit
+
+- name: Enable and start LiveKit
+  ansible.builtin.systemd:
+    name: intron-livekit
+    enabled: true
+    state: started
+    daemon_reload: true
+
+########################################################
+# Apply pending restarts BEFORE verifying anything.
+#
+# Without this the checks below test the OLD containers and pass, because
+# handlers run at the end of the play. Same reason the kamailio role flushes
+# before its wait_for.
+########################################################
+- name: Flush handlers before verification
+  ansible.builtin.meta: flush_handlers
+
+########################################################
+# THE UNFLUSHED-HANDLER TRAP, and it bit us for real.
+#
+# A play that FAILS never runs its handlers. The run that first added the sip
+# service to the compose file failed later, on the dispatch rule - so the
+# compose file was written but `restart livekit` never fired. The next run
+# then found the file already correct, reported no change, notified nothing,
+# and livekit-sip was never started. Two green plays, no SIP container, and
+# nothing in either output saying so.
+#
+# Converging on observed state rather than on change notifications is the only
+# thing that recovers from that, because by then there is no change left to
+# notice.
+########################################################
+- name: Check whether livekit-sip is actually running
+  ansible.builtin.command: docker ps --filter name=livekit-sip --format '{% raw %}{{.Names}}{% endraw %}'
+  register: livekit_sip_ps
+  changed_when: false
+  failed_when: false
+  when: livekit_sip_enabled
+
+- name: Start livekit-sip when the compose file has it but the container does not
+  ansible.builtin.systemd:
+    name: intron-livekit
+    state: restarted
+  when:
+    - livekit_sip_enabled
+    - livekit_sip_ps.stdout | default('') | trim | length == 0
+
+########################################################
+# Prove it came up, rather than assuming.
+#
+# /rtc/validate is LiveKit's own readiness endpoint. Checked on LOOPBACK, not
+# through the public name, and the distinction is the point: this separates
+# "LiveKit is running" from "DNS and the certificate are right". A single check
+# through the public URL conflates the two, and the failure would point at
+# LiveKit when the problem is a missing NS record.
+#
+# Retried because the container has to pull, start, and connect to Redis first.
+########################################################
+- name: Wait for the LiveKit API to answer on loopback
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ livekit_api_port }}/rtc/validate"
+    status_code: [200, 401, 403]
+  register: livekit_health
+  retries: 30
+  delay: 5
+  until: livekit_health is succeeded
+  changed_when: false
+
+########################################################
+# The public path, checked separately and NOT fatal.
+#
+# A failure here with the loopback check passing is DNS or the certificate,
+# never LiveKit. Reported rather than raised because the box is correctly
+# configured at that point and the remaining work is somebody else's NS record.
+########################################################
+- name: Check the public HTTPS endpoint
+  ansible.builtin.uri:
+    url: "https://{{ livekit_fqdn }}/rtc/validate"
+    status_code: [200, 401, 403]
+  register: livekit_public_health
+  failed_when: false
+  changed_when: false
+
+- name: Report the public endpoint state
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        'Public endpoint OK: https://' ~ livekit_fqdn ~ ' is serving a valid certificate.'
+        if livekit_public_health.status is defined and livekit_public_health.status in [200, 401, 403]
+        else
+        'Public endpoint NOT reachable yet. LiveKit itself is healthy on loopback, so this is DNS delegation or certificate issuance, not the server. Check the NS records first, then: journalctl -u intron-livekit | grep -i acme'
+      }}
+
+########################################################
+# The SIP trunk and dispatch rule.
+#
+# Runs AFTER the health check, because the lk CLI talks to the running
+# livekit-server. Provisioning against a server that has not started yet fails
+# with a connection error that reads like a credential problem.
+########################################################
+########################################################
+# Prove livekit-sip is listening, not merely that its container exists.
+#
+# A container can be up and the process inside dead or still starting, and the
+# trunk and dispatch rule below would then provision cleanly against a SIP
+# service nothing can reach.
+########################################################
+- name: Wait for livekit-sip to bind its SIP port
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ livekit_sip_listen_port }}"
+    timeout: 60
+  when: livekit_sip_enabled
+
+- name: Install the LiveKit CLI
+  ansible.builtin.unarchive:
+    src: "https://github.com/livekit/livekit-cli/releases/download/v{{ livekit_cli_version }}/lk_{{ livekit_cli_version }}_linux_amd64.tar.gz"
+    dest: /usr/local/bin
+    remote_src: true
+    include:
+      - lk
+    owner: root
+    group: root
+    mode: "0755"
+    creates: /usr/local/bin/lk
+  when: livekit_sip_enabled
+
+- name: Deploy the SIP provisioning script
+  ansible.builtin.template:
+    src: sip-provision.sh.j2
+    dest: "{{ livekit_config_root }}/sip-provision.sh"
+    owner: root
+    group: root
+    mode: "0750"
+  when: livekit_sip_enabled
+
+########################################################
+# Idempotent by name: the script creates only what is missing, so this is
+# `changed_when: false` unless it actually created something.
+#
+# NOT no_log, deliberately. The script prints trunk and rule ids and the
+# resulting tables, which is exactly what you want in the play output when a
+# call later fails to find a room. It reads the API secret from Secrets
+# Manager on the box and never echoes it.
+########################################################
+- name: Provision the inbound trunk and dispatch rule
+  ansible.builtin.command: "{{ livekit_config_root }}/sip-provision.sh"
+  register: livekit_sip_provision
+  changed_when: "'creating' in livekit_sip_provision.stdout"
+  when: livekit_sip_enabled
+
+- name: Show the SIP provisioning result
+  ansible.builtin.debug:
+    var: livekit_sip_provision.stdout_lines
+  when: livekit_sip_enabled and livekit_sip_provision is defined

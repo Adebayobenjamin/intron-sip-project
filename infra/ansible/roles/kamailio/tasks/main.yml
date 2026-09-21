@@ -1,0 +1,180 @@
+---
+########################################################
+# Kamailio — the SIP hub.
+#
+# Auth, tenant routing, and dispatch to the FreeSWITCH farm. It is the only
+# thing on this platform a carrier ever addresses.
+########################################################
+
+########################################################
+# THE KEY IS SAVED AS .asc, NOT .gpg, AND THAT IS NOT COSMETIC.
+#
+# Upstream serves the key at a path ending in .gpg, but the FILE IS ASCII
+# ARMORED:
+#
+#   $ file kamailiodebkey.gpg
+#   PGP public key block Public-Key (old)
+#   -----BEGIN PGP PUBLIC KEY BLOCK-----
+#
+# apt decides how to parse a signed-by keyring FROM ITS EXTENSION: .gpg must be
+# a binary keyring, .asc may be armored. Downloading upstream's file to a .gpg
+# path therefore produces a keyring apt cannot read, and the failure names
+# neither the file nor the format:
+#
+#   NO_PUBKEY FB40D3E6508EA4C8
+#   The repository 'http://deb.kamailio.org/kamailio58 bookworm InRelease' is
+#   not signed.
+#
+# which reads like a missing or wrong key rather than a correct key in the
+# wrong encoding. (The alternative is `gpg --dearmor` into a .gpg; keeping it
+# armored is fewer moving parts and needs no gpg on the box.)
+#
+# HTTPS, not HTTP. This is the trust anchor for everything the repository then
+# installs — fetching it in the clear lets anyone on the path substitute their
+# own key AND their own packages, and apt would verify the result happily
+# because the two would agree. deb.kamailio.org serves both the key and the
+# repository over TLS; there is no reason to take either in plaintext.
+########################################################
+- name: Install the Kamailio apt key
+  ansible.builtin.get_url:
+    url: "https://deb.kamailio.org/kamailiodebkey.gpg"
+    dest: /etc/apt/keyrings/kamailio.asc
+    mode: "0644"
+
+# The earlier, unreadable copy. Left behind it is only a confusing decoy for
+# the next person who greps /etc/apt/keyrings while debugging a signature
+# error.
+- name: Remove the mis-encoded keyring from the previous layout
+  ansible.builtin.file:
+    path: /etc/apt/keyrings/kamailio.gpg
+    state: absent
+
+- name: Add the Kamailio apt repository
+  # From the project's own repository, not Debian's. Debian ships a version
+  # well behind and splits modules differently — and the modules this config
+  # needs (dispatcher, rtpengine, nathelper) are not all in the base package
+  # either way.
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by=/etc/apt/keyrings/kamailio.asc]
+      https://deb.kamailio.org/kamailio{{ kamailio_version | replace('.', '') }}
+      {{ kamailio_repo_distro }} main
+    filename: kamailio
+    state: present
+  register: kamailio_repo
+
+- name: Install Kamailio
+  # The module packages are listed EXPLICITLY in group_vars rather than
+  # inferred, because Debian splits Kamailio across a package per module group
+  # and a missing one fails at STARTUP with "cannot load module" — after the
+  # play has already reported success.
+  ansible.builtin.apt:
+    name: "{{ ['kamailio'] + kamailio_modules }}"
+    state: present
+    update_cache: "{{ kamailio_repo.changed }}"
+
+- name: Create the Kamailio config directory
+  ansible.builtin.file:
+    path: "{{ kamailio_config_dir }}"
+    state: directory
+    owner: root
+    group: kamailio
+    mode: "0750"
+
+########################################################
+# NO SECRETS. Kamailio holds no credentials at all.
+#
+# CONTROL_PLANE_API_TOKEN went when admission moved into the controller, and
+# FREESWITCH_ESL_PASSWORD went when originate became controller -> FreeSWITCH
+# over ESL. Nothing in kamailio.cfg reads either, so the template, the
+# import_file, the ExecStartPre hook, the Secrets Manager container and the
+# edge role's secrets-read IAM policy have all been removed together.
+#
+# ALL THE WAY, DELIBERATELY. A half-removed hydration path is worse than
+# either end state: it renders an empty file every start, and reads as an
+# intentional mechanism to whoever finds it next.
+########################################################
+- name: Remove the retired Kamailio secret files
+  # The rendered secrets.cfg held FREESWITCH_ESL_PASSWORD in cleartext. Ansible
+  # does not clean up files whose task has been deleted, so without this the
+  # credential would sit on disk indefinitely, unreferenced and unrotatable.
+  ansible.builtin.file:
+    path: "{{ kamailio_config_dir }}/{{ item }}"
+    state: absent
+  loop:
+    - secrets.cfg
+    - secrets.cfg.tpl
+  notify: restart kamailio
+
+- name: Deploy kamailio.cfg
+  ansible.builtin.template:
+    src: kamailio.cfg.j2
+    dest: "{{ kamailio_config_dir }}/kamailio.cfg"
+    owner: root
+    group: kamailio
+    mode: "0640"
+    # Refuse to write a config Kamailio would reject. Without this the play
+    # succeeds, the handler restarts the service, and the service fails to come
+    # back — taking the whole platform down on a typo.
+    validate: "kamailio -c -f %s"
+  notify: restart kamailio
+
+########################################################
+# Dispatcher list — the FreeSWITCH farm, rendered from the inventory.
+#
+# Generated rather than maintained, so adding a node is a Terraform count plus
+# a re-run of this play and nothing is written twice.
+########################################################
+- name: Deploy the dispatcher list
+  ansible.builtin.template:
+    src: dispatcher.list.j2
+    dest: "{{ kamailio_config_dir }}/dispatcher.list"
+    owner: root
+    group: kamailio
+    mode: "0640"
+  notify: reload kamailio dispatcher
+
+- name: Deploy the Kamailio defaults
+  ansible.builtin.template:
+    src: kamailio.default.j2
+    dest: /etc/default/kamailio
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart kamailio
+
+- name: Deploy the systemd unit override
+  # A drop-in rather than a replacement unit: package upgrades keep working.
+  # It carries the restart limits and the fd limit. It used to carry a secret
+  # hydration ExecStartPre as well; Kamailio has no secrets now.
+  ansible.builtin.file:
+    path: /etc/systemd/system/kamailio.service.d
+    state: directory
+    mode: "0755"
+
+- name: Deploy the Kamailio unit drop-in
+  ansible.builtin.template:
+    src: kamailio-override.conf.j2
+    dest: /etc/systemd/system/kamailio.service.d/override.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart kamailio
+
+- name: Flush handlers before verification
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start Kamailio
+  ansible.builtin.systemd:
+    name: kamailio
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Verify Kamailio is listening for SIP
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ sip_port }}"
+    timeout: 30

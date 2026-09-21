@@ -1,0 +1,33 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+########################################################
+# A Kamailio restart DROPS EVERY CALL ON THE PLATFORM.
+#
+# It is the only thing carriers address, so while it is down nothing arrives
+# and nothing in progress can be torn down cleanly. There is no graceful
+# restart and no drain.
+#
+# playbooks/edge.yml sets serial: 1 so a multi-node edge is never fully down at
+# once — which does nothing with the single node beta runs, and is the reason
+# raising edge_count does not also require remembering it.
+########################################################
+- name: restart kamailio
+  ansible.builtin.systemd:
+    name: kamailio
+    state: restarted
+    daemon_reload: true
+
+########################################################
+# Reloading the dispatcher list does NOT restart Kamailio — the module re-reads
+# the file in place and calls in progress are untouched.
+#
+# Which is why adding a FreeSWITCH node is a safe, any-time operation and a
+# config change is not.
+########################################################
+- name: reload kamailio dispatcher
+  ansible.builtin.command:
+    cmd: kamcmd dispatcher.reload
+  changed_when: true

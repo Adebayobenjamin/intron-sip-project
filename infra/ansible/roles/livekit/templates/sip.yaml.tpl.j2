@@ -1,0 +1,61 @@
+{{ ansible_managed | comment }}
+# livekit-sip — the bridge between our SIP platform and LiveKit rooms.
+#
+# DEPLOYED AS .tpl. The ${...} placeholders are substituted ON THE BOX at every
+# service start by fetch-and-render-secrets.sh. Same mechanism as livekit.yaml,
+# and the same keys: livekit-sip authenticates to livekit-server with them.
+
+api_key: '${LIVEKIT_API_KEY}'
+api_secret: '${LIVEKIT_API_SECRET}'
+
+# Loopback. livekit-server runs in the same host network namespace, so this
+# never leaves the box and needs no TLS.
+ws_url: 'ws://localhost:{{ livekit_api_port }}'
+
+redis:
+  address: 'localhost:6379'
+
+########################################################
+# SIP signalling.
+#
+# MUST MATCH sip_port in iac/stacks/livekit/_main/variables.tf, which opens
+# it, and livekit_sip_host/livekit_sip_port in the inventory, which is what
+# Kamailio's dispatcher dials. Three files, one number.
+#
+# 5060 rather than Intron's 5160: nothing else on this instance binds it. On
+# their box OpenSIPS already held 5060, which is the only reason livekit-sip
+# moved.
+########################################################
+sip_port: {{ livekit_sip_listen_port }}
+
+# SIP-side media. A DIFFERENT RANGE from livekit.yaml's rtc.port_range_*:
+# that carries WebRTC to browsers and agents, this carries plain RTP to and
+# from RTPEngine on the edge. Two media paths meet inside this process.
+rtp_port: {{ livekit_sip_rtp_port_min }}-{{ livekit_sip_rtp_port_max }}
+
+########################################################
+# THE ADVERTISED ADDRESS, AND IT IS THE OPPOSITE OF livekit.yaml.
+#
+# livekit.yaml sets use_external_ip: TRUE, because browsers and Intron's agent
+# reach this box from the internet and must be told the Elastic IP.
+#
+# livekit-sip must do the reverse. The only thing that sends it SIP is our own
+# Kamailio, inside this VPC. Setting true here would make it discover
+# {{ livekit_public_ip | default('the Elastic IP') }} via STUN and advertise
+# that in its SDP - so RTPEngine, sitting a few metres away on a private
+# address, would send media out to the public internet and back, if it worked
+# at all.
+#
+# FALSE makes it advertise {{ ansible_host | default('its private address') }},
+# which is what RTPEngine can actually reach.
+#
+# Same class of bug as the Kamailio `advertise` and RTPEngine
+# `--advertised-address` settings in the README, reached from the opposite
+# direction: there the trap is advertising a private address to the public
+# internet, here it is advertising a public address to the private network.
+# Both present as a call that sets up perfectly and has no audio.
+########################################################
+use_external_ip: false
+
+logging:
+  level: {{ livekit_log_level }}

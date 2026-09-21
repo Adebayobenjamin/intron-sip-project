@@ -1,0 +1,48 @@
+---
+- name: Configure the ESL controller and control-plane API
+  hosts: control_plane
+  become: true
+
+  ########################################################
+  # serial: 1 is not a nicety here — it is the entire reason there are two
+  # instances.
+  #
+  # The app-service role drains a node's ESL sockets before restarting its
+  # container. That only works if the OTHER node is still in the target group
+  # and still accepting. Running both at once deregisters both, and every call
+  # in progress is dropped by the deploy that was designed to avoid exactly
+  # that.
+  ########################################################
+  serial: 1
+
+  pre_tasks:
+    # An image tag left as a placeholder would have the role pull a
+    # nonexistent image and leave the unit in a restart loop, AFTER it had
+    # already drained and stopped the working container.
+    - name: Assert every service has a real image tag
+      ansible.builtin.assert:
+        that:
+          - item.image_tag is defined
+          - item.image_tag | length > 0
+          - item.image_tag is not match('REPLACE_ME')
+        fail_msg: >-
+          {{ item.name }} has no image tag set. Edit app_services in
+          inventories/{{ env_name }}/group_vars/control_plane.yml, or pass one:
+          make play PLAYBOOK=control-plane EXTRA_VARS='...'
+      loop: "{{ app_services }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Assert the ECR registry is configured
+      ansible.builtin.assert:
+        that:
+          - ecr_registry is not match('REPLACE_ME')
+        fail_msg: >-
+          ecr_registry still holds the placeholder account id. Set it from
+          the ecr stack: cd infra/iac && make output STACK=ecr ENV={{ env_name }}
+          TOKEN=... EXTRA="repository_urls"
+
+  roles:
+    - common
+    - docker
+    - app-service

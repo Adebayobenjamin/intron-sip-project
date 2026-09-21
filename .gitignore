@@ -1,0 +1,38 @@
+# ---- Terraform ----
+**/.terraform/
+*.tfstate
+*.tfstate.*
+errored.tfstate
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored — it should be committed.
+
+# ---- Secrets / keys / env ----
+**/.env
+.env
+.env.*
+# ...but the templates must be committed, or a fresh clone has no list of the
+# keys a service needs. They hold placeholder names and no values.
+!.env.example
+!**/.env.example
+*.pem
+*.key
+id_rsa*
+*-secrets.json
+secrets.json
+
+# ---- Ansible ----
+*.retry
+infra/ansible/inventories/*/host_vars/*.local.yml
+
+# ---- Editor / tooling ----
+.DS_Store
+.claude/
+.vscode/
+__pycache__/
+*.pyc

@@ -1,0 +1,182 @@
+---
+########################################################
+# Base configuration for every host in the fleet.
+#
+# NOTE HOW LITTLE NETWORKING IS IN HERE compared with the equivalent role on a
+# bare-metal or Hetzner fleet. There is no NIC discovery, no netplan file, no
+# default route to persist, no DNS to configure, and no "did the private
+# interface ever get an address" assertion. An EC2 instance has one interface,
+# receives its address and routes from the VPC before cloud-init runs, and
+# resolves through the VPC resolver. The entire class of bug where a private
+# NIC silently never came up does not exist.
+#
+# What IS here: packages, the AWS CLI, the boot-time secret hydration script,
+# and socket tuning for the hosts that carry SIP.
+########################################################
+
+- name: Wait for the instance to have working egress
+  ansible.builtin.wait_for:
+    host: "{{ item }}"
+    port: 443
+    timeout: 120
+  loop:
+    # The regional S3 endpoint proves the gateway VPC endpoint and the route
+    # table are in place — the path the SSM agent and every package fetch
+    # depend on. Checked first because a failure here is a network problem,
+    # and every failure after it would look like a package problem.
+    - "s3.{{ aws_region }}.amazonaws.com"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Update the apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ common_base_packages + common_extra_packages }}"
+    state: present
+
+- name: Set the timezone to UTC
+  community.general.timezone:
+    name: UTC
+
+########################################################
+# AWS CLI v2, from the official zip.
+#
+# CORRECTION TO A PREVIOUS NOTE HERE, which claimed Debian ships v1. It does
+# not: Debian 12 carries awscli 2.9.19 at /usr/bin/aws, verified on the
+# instances. The v1 concern was inherited from a Hetzner setup using SSM hybrid
+# activations and does not apply to EC2 instance profiles at all.
+#
+# So this install is about CURRENCY, not major version. 2.9.19 dates from early
+# 2023 and lags on newer API surface; the boot-time secret fetch and the app
+# tier's NLB drain script both depend on the CLI behaving predictably, so the
+# fleet pins a current one rather than inheriting whatever the base image froze.
+#
+# It lands at /usr/local/bin/aws, which precedes /usr/bin in the default PATH,
+# so it wins without removing Debian's. If this task is ever dropped, nothing
+# breaks immediately — the distro copy is functional — which is precisely why
+# the reason is written down.
+########################################################
+- name: Check whether the AWS CLI is installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/aws
+  register: aws_cli_binary
+
+- name: Install AWS CLI v2
+  when: not aws_cli_binary.stat.exists
+  block:
+    - name: Determine the architecture for the AWS CLI download
+      ansible.builtin.set_fact:
+        awscli_arch: "{{ 'aarch64' if ansible_architecture == 'aarch64' else 'x86_64' }}"
+
+    - name: Download the AWS CLI v2 archive
+      ansible.builtin.get_url:
+        url: "https://awscli.amazonaws.com/awscli-exe-linux-{{ awscli_arch }}.zip"
+        dest: /tmp/awscliv2.zip
+        mode: "0644"
+
+    - name: Unpack the AWS CLI archive
+      ansible.builtin.unarchive:
+        src: /tmp/awscliv2.zip
+        dest: /tmp/
+        remote_src: true
+
+    - name: Run the AWS CLI installer
+      ansible.builtin.command: /tmp/aws/install
+      args:
+        creates: /usr/local/bin/aws
+
+    - name: Remove the AWS CLI installer files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/awscliv2.zip
+        - /tmp/aws
+
+- name: Verify the instance profile resolves
+  # Proves three things at once, and all three are things that fail silently
+  # later: the CLI works, IMDSv2 is reachable, and the role attached by
+  # Terraform is the one the box actually has. Without this, a wrong or missing
+  # instance profile first shows up as a service failing to start with an
+  # AccessDenied from Secrets Manager.
+  ansible.builtin.command:
+    cmd: aws sts get-caller-identity --output json
+  register: caller_identity
+  changed_when: false
+
+- name: Report the assumed identity
+  ansible.builtin.debug:
+    msg: "{{ (caller_identity.stdout | from_json).Arn }}"
+
+########################################################
+# Boot-time secret hydration.
+#
+# Each service's systemd unit calls this from ExecStartPre with its own
+# Secrets Manager container and config directory. The script fetches the
+# container using the instance profile, then substitutes the values into every
+# *.tpl file under that directory.
+#
+# BOOT-TIME RATHER THAN DEPLOY-TIME, deliberately. A rotated credential is
+# picked up by `systemctl restart` with no Ansible run, and no resolved secret
+# ever exists in this repository, in Terraform state, or in Ansible's S3
+# transport bucket. That last one is why the role templates are deployed as
+# .tpl files with placeholders rather than rendered by Jinja with real values.
+########################################################
+- name: Install fetch-and-render-secrets.sh
+  ansible.builtin.copy:
+    src: fetch-and-render-secrets.sh
+    dest: /usr/local/bin/fetch-and-render-secrets.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+########################################################
+# Socket tuning for the hosts that carry SIP.
+#
+# rmem_default is the number that decides whether a burst is absorbed or
+# dropped, and it is the one people miss. Kamailio never calls
+# setsockopt(SO_RCVBUF), so every UDP socket it opens inherits the DEFAULT —
+# rmem_max is only a ceiling for a process that asks, and Kamailio does not
+# ask. Raising max alone changes nothing.
+#
+# What fills a UDP receive queue is arrival SHAPE rather than average load: a
+# carrier retransmitting an unanswered INVITE, or a pacing tick publishing a
+# whole batch at once. Doubling the ceiling doubles the burst absorbed before
+# the kernel starts discarding — and a discard here is indiscriminate, taking
+# the ACKs and BYEs of calls already in progress along with the new INVITEs.
+#
+# THIS IS HEADROOM, NOT A FIX. It buys time for the workers to drain; it does
+# not make them drain faster. A sustained backlog is a routing-logic or
+# RTPEngine problem and has to be addressed there.
+#
+# NOT PREALLOCATED — a limit, not a reservation. Memory is consumed only while
+# packets are actually queued, so the cost at rest is zero.
+#
+# AND IT ONLY REACHES NEW SOCKETS. A socket's buffer is sized when it is
+# created, so a running Kamailio keeps what it started with. This needs a
+# service restart to take effect, and that restart drops every registration.
+#
+# wmem_default is deliberately left lower: the send side is not what overflows,
+# and a full send buffer blocks or errors visibly where a full receive buffer
+# discards in silence.
+########################################################
+- name: Tune network buffers for SIP
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    sysctl_file: /etc/sysctl.d/99-intron-sip.conf
+    reload: true
+  loop:
+    - { key: "net.core.rmem_max", value: "{{ network_rmem_max }}" }
+    - { key: "net.core.rmem_default", value: "{{ network_rmem_default }}" }
+    - { key: "net.core.wmem_max", value: "{{ network_wmem_max }}" }
+    - { key: "net.core.wmem_default", value: "{{ network_wmem_default }}" }
+    - { key: "net.core.netdev_max_backlog", value: "{{ network_netdev_max_backlog }}" }
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+  when: tune_network_buffers

@@ -1,0 +1,121 @@
+---
+########################################################
+# One systemd unit per entry in app_services.
+#
+# THE SHAPE OF A DEPLOY, and its honest limitation.
+#
+# `systemctl restart intron-esl-controller` is not a restart of a stateless
+# process: the controller holds a TCP socket for the life of every call it is
+# handling, and stopping it ends those calls.
+#
+# There is no drain, because there is nowhere to drain TO. That machinery
+# needed a load balancer and a second instance to move traffic to; at one
+# instance it reduced to "in-flight calls finish while new calls fail anyway",
+# which did not justify the balancer. See iac/stacks/control-plane/_main/dns.tf.
+#
+# What the unit does instead:
+#
+#   ExecStartPre   fetch secrets from Secrets Manager, render the env file
+#   ExecStartPre   pull the pinned image tag
+#   ExecStart      run the container in the foreground
+#   ExecStop       SIGTERM, then a grace period for the app to close cleanly
+#
+# So: RESTART DELIBERATELY. A deploy is a short outage, not a rolling one.
+########################################################
+
+- name: Create the config root
+  ansible.builtin.file:
+    path: "{{ app_config_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Create per-service config directories
+  ansible.builtin.file:
+    path: "{{ app_config_root }}/{{ item.name }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop: "{{ app_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+########################################################
+# The env file is deployed as a .tpl carrying ${VAR} placeholders.
+#
+# fetch-and-render-secrets.sh substitutes real values at every service start,
+# from Secrets Manager, using the instance profile. Nothing resolved is ever
+# written by Ansible — which means no secret transits the S3 transport bucket,
+# lands in this repository, or appears in a play's diff output.
+#
+# The rendered sibling (.env, without the .tpl) is what the container reads.
+########################################################
+- name: Deploy the service env templates
+  ansible.builtin.template:
+    src: service.env.tpl.j2
+    dest: "{{ app_config_root }}/{{ item.name }}/{{ item.name }}.env.tpl"
+    owner: root
+    group: root
+    mode: "0640"
+  loop: "{{ app_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify: restart app services
+
+- name: Deploy the systemd units
+  ansible.builtin.template:
+    src: app-service.service.j2
+    dest: "/etc/systemd/system/intron-{{ item.name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ app_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify:
+    - reload systemd
+    - restart app services
+
+- name: Flush handlers so the units exist before they are enabled
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start the services
+  ansible.builtin.systemd:
+    name: "intron-{{ item.name }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+  loop: "{{ app_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+########################################################
+# Prove the health endpoint answers before the play moves on.
+#
+# The NLB health check is the thing that decides whether this node receives
+# calls, and a target that never goes healthy is invisible from here — the
+# play reports success and the node quietly takes no traffic. Checking the same
+# endpoint the NLB checks turns that into a play failure.
+#
+# Retried because a container has to start, and the first pull on a fresh
+# instance can take a while.
+########################################################
+- name: Wait for each service to report healthy
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ item.health_port }}{{ health_check_path }}"
+    status_code: 200
+  register: health_probe
+  retries: 30
+  delay: 5
+  until: health_probe is succeeded
+  # ONE PROBE PER SERVICE, on that service's own port.
+  #
+  # This used to hit a single shared app_health_port once, on the theory that
+  # both containers shared it. They cannot: both run --network host on this one
+  # instance, so the second to bind would fail. Probing one port also meant a
+  # healthy first container made the play pass while the second was dead.
+  loop: "{{ app_services }}"
+  loop_control:
+    label: "{{ item.name }}:{{ item.health_port }}"

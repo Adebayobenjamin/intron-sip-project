@@ -1,0 +1,23 @@
+---
+########################################################
+# Everything, in dependency order.
+#
+# ORDER MATTERS AND IT IS NOT ALPHABETICAL:
+#
+#   1. control-plane   The ESL listener has to be accepting connections before
+#                      FreeSWITCH starts opening sockets to it. Starting the
+#                      other way round means every call that arrives in the gap
+#                      is dropped at answer.
+#   2. freeswitch      Takes by far the longest — a source build of ~20 minutes
+#                      on a fresh node. Before Kamailio so the dispatcher has
+#                      something healthy to dispatch to.
+#   3. edge            Last. The moment Kamailio is up, carriers can deliver
+#                      calls; everything downstream should already be ready.
+#
+# Running individual playbooks is the normal case. This one is for a rebuild
+# from nothing.
+########################################################
+
+- import_playbook: control-plane.yml
+- import_playbook: freeswitch.yml
+- import_playbook: edge.yml

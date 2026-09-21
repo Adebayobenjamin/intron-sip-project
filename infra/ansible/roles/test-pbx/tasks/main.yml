@@ -1,0 +1,210 @@
+---
+########################################################
+# Asterisk, configured as a stand-in client SBC.
+#
+# Everything here assumes this box is DISPOSABLE. There is no secret
+# hydration, no restart-safety ceremony and no drain - the platform tiers have
+# those because they carry real calls, and this one does not.
+########################################################
+
+- name: Assert the node knows its public address
+  # Same assertion the edge play makes, for the same reason: Asterisk cannot
+  # discover its Elastic IP, and a wrong value here produces calls that set up
+  # cleanly with no audio rather than anything that looks like an error.
+  ansible.builtin.assert:
+    that:
+      - test_pbx_public_ip is defined
+      - test_pbx_public_ip | length > 0
+      - test_pbx_public_ip is not match('REPLACE_ME')
+    fail_msg: >-
+      test_pbx_public_ip is unset or still a placeholder for
+      {{ inventory_hostname }}. Get it from Terraform:
+      cd infra/iac && make output STACK=test-pbx ENV={{ env_name }}
+      EXTRA="-raw ansible_inventory_hint"
+    success_msg: "Advertising {{ test_pbx_public_ip }}"
+
+- name: Assert the agent password is set
+  # Rendered straight into pjsip.conf, so an unset value would produce a
+  # syntactically valid config with an empty password - an extension anyone
+  # who can reach 5060 could register to.
+  ansible.builtin.assert:
+    that:
+      - test_pbx_agent_password is defined
+      - test_pbx_agent_password | length >= 16
+    fail_msg: >-
+      test_pbx_agent_password is unset or too short. This box is on a public
+      address; a weak extension password on an internet-facing PBX is a
+      toll-fraud target. Generate one with `openssl rand -base64 24` and pass
+      it with -e, or put it in group_vars.
+    success_msg: "agent password present"
+
+- name: Assert the edge public address is known
+  ansible.builtin.assert:
+    that:
+      - intron_edge_public_ip is defined
+      - intron_edge_public_ip | length > 0
+    fail_msg: >-
+      intron_edge_public_ip is unset. pjsip.conf identifies the Intron edge by
+      source address, so without it Asterisk challenges the handoff INVITE for
+      authentication that Kamailio cannot provide, and the call fails with 401.
+      Get it from: cd infra/iac && make output STACK=sip-core ENV={{ env_name }}
+      EXTRA="-raw edge_public_ips"
+
+- name: Install Asterisk
+  ansible.builtin.apt:
+    name: "{{ test_pbx_packages }}"
+    state: present
+    update_cache: true
+
+########################################################
+# Config. Three files, each notifying a restart.
+#
+# `asterisk -rx "core reload"` would be gentler, but pjsip transport changes
+# are not picked up by a reload and the failure is subtle - the daemon keeps
+# running with the old transport while the config on disk says otherwise. A
+# restart on a box carrying no production calls costs nothing.
+########################################################
+- name: Deploy pjsip.conf
+  ansible.builtin.template:
+    src: pjsip.conf.j2
+    dest: /etc/asterisk/pjsip.conf
+    owner: root
+    group: asterisk
+    mode: "0640"
+  notify: restart asterisk
+
+- name: Deploy extensions.conf
+  ansible.builtin.template:
+    src: extensions.conf.j2
+    dest: /etc/asterisk/extensions.conf
+    owner: root
+    group: asterisk
+    mode: "0640"
+  notify: restart asterisk
+
+- name: Deploy rtp.conf
+  ansible.builtin.template:
+    src: rtp.conf.j2
+    dest: /etc/asterisk/rtp.conf
+    owner: root
+    group: asterisk
+    mode: "0640"
+  notify: restart asterisk
+
+- name: Enable and start Asterisk
+  ansible.builtin.systemd:
+    name: asterisk
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Flush handlers so the config is live before it is verified
+  ansible.builtin.meta: flush_handlers
+
+########################################################
+# Verification. Each check exists because the failure it catches is silent.
+########################################################
+- name: Verify Asterisk is listening for SIP
+  # UDP, so wait_for cannot be used - it does a TCP connect and would time out
+  # against a healthy daemon. Same trap as RTPEngine's ng port.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    ss -lnup | grep -q ":{{ test_pbx_sip_port }} " && echo listening
+  args:
+    executable: /bin/bash
+  register: test_pbx_sip_listening
+  changed_when: false
+  failed_when: false
+
+- name: Fail if Asterisk is not listening
+  ansible.builtin.assert:
+    that:
+      - "'listening' in test_pbx_sip_listening.stdout"
+    fail_msg: >-
+      Asterisk is not listening on UDP {{ test_pbx_sip_port }}. Check
+      `systemctl status asterisk` and `asterisk -rx "pjsip show transports"`.
+    success_msg: "SIP listening on {{ test_pbx_sip_port }}/udp"
+
+- name: Verify Asterisk is listening for SIP over TCP
+  # The operator's network drops UDP 5060, so TCP is the transport the
+  # softphone actually registers over. Checked separately: a UDP-only listener
+  # would pass the check above and leave Linphone timing out exactly as before.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    ss -lntp | grep -q ":{{ test_pbx_sip_port }} " && echo listening
+  args:
+    executable: /bin/bash
+  register: test_pbx_tcp_listening
+  changed_when: false
+  failed_when: false
+
+- name: Fail if the TCP transport did not come up
+  ansible.builtin.assert:
+    that:
+      - "'listening' in test_pbx_tcp_listening.stdout"
+    fail_msg: >-
+      Asterisk is not listening on TCP {{ test_pbx_sip_port }}. The softphone
+      registers over TCP because this operator's network drops UDP 5060, so
+      without this transport Linphone times out with nothing on the wire.
+      Check `asterisk -rx "pjsip show transports"`.
+    success_msg: "SIP listening on {{ test_pbx_sip_port }}/tcp"
+
+- name: Read back what Asterisk resolved for the external address
+  # THE CHECK THAT MATTERS. A transport that came up with the private address
+  # produces calls that connect with no audio, and nothing else in this play
+  # would notice.
+  ansible.builtin.command:
+    cmd: asterisk -rx "pjsip show transport transport-udp"
+  register: test_pbx_transport
+  changed_when: false
+  failed_when: false
+
+- name: Fail if the external address did not take
+  ansible.builtin.assert:
+    that:
+      - test_pbx_public_ip in test_pbx_transport.stdout
+    fail_msg: >-
+      Asterisk's transport does not carry {{ test_pbx_public_ip }} as its
+      external address, so its SDP will advertise {{ ansible_host }} — a
+      private address the Intron edge cannot route to. The call will set up
+      cleanly and have no audio in either direction.
+      Got: {{ test_pbx_transport.stdout | default('(no output)') | truncate(400) }}
+    success_msg: "transport advertises {{ test_pbx_public_ip }}"
+
+########################################################
+# Contact reachability.
+#
+# Only meaningful once a softphone has registered, so it reports rather than
+# asserts - a fresh box with nothing registered is not broken.
+########################################################
+- name: Check whether a softphone is registered and reachable
+  ansible.builtin.command:
+    cmd: asterisk -rx "pjsip show contacts"
+  register: test_pbx_contacts
+  changed_when: false
+  failed_when: false
+
+- name: Report contact status
+  ansible.builtin.debug:
+    msg: >-
+      {% if 'Avail' in test_pbx_contacts.stdout %}
+      Agent registered and reachable (qualified every {{ test_pbx_qualify_seconds }}s).
+      {% elif 'NonQual' in test_pbx_contacts.stdout %}
+      Agent registered but NOT QUALIFIED - qualify_frequency did not take. The
+      contact will look present while its NAT mapping quietly expires, and the
+      first handoff after that fails. Check `pjsip show aor
+      {{ test_pbx_agent_extension }}`.
+      {% elif 'No objects found' in test_pbx_contacts.stdout or 'Objects found: 0' in test_pbx_contacts.stdout %}
+      No softphone registered yet. Point Linphone at
+      sip:{{ test_pbx_agent_extension }}@{{ test_pbx_public_ip }} over TCP.
+      {% else %}
+      Contact state unclear: {{ test_pbx_contacts.stdout | default('') | truncate(200) }}
+      {% endif %}
+
+- name: Report how to point a softphone at this box
+  ansible.builtin.debug:
+    msg:
+      - "Linphone -> SIP address: sip:{{ test_pbx_agent_extension }}@{{ test_pbx_public_ip }}"
+      - "Linphone -> transport: TCP  (UDP 5060 is dropped by this operator network)"
+      - "Handoff target for the tenant: sip:{{ test_pbx_agent_extension }}@{{ test_pbx_public_ip }}"
+      - "Watch a call land: asterisk -rvvv   (or sngrep -d any port {{ test_pbx_sip_port }})"

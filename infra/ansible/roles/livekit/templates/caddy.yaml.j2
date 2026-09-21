@@ -1,0 +1,95 @@
+{{ ansible_managed | comment }}
+# Caddy, in layer4 mode. Two jobs, and neither is serving a website.
+#
+#   1. Get and renew the TLS certificate, over ACME, automatically.
+#   2. Demultiplex port 443 by TLS SNI into two backends.
+#
+# WHY CADDY AND NOT AN ALB.
+# An Application Load Balancer with an ACM certificate is the obvious AWS
+# answer and it solves half the problem for about 20 dollars a month: it
+# terminates HTTPS, but WebRTC media is UDP {{ livekit_rtc_udp_port_min }}-{{ livekit_rtc_udp_port_max }} straight to this
+# instance and an ALB cannot carry UDP at all. ACM is free but cannot be
+# installed on EC2 either - the private key is not exportable. So the cert
+# would have to live on the box regardless, and once it does the ALB is paying
+# for nothing.
+#
+# NO PLAINTEXT CONFIG HERE. Caddy needs no credentials, so unlike livekit.yaml
+# this file ships rendered rather than as a .tpl.
+
+logging:
+  logs:
+    default:
+      level: INFO
+
+########################################################
+# Certificate storage.
+#
+# Backed by the root volume, which is delete_on_termination. Replacing the
+# instance therefore loses the certificate and Caddy re-issues on first boot.
+#
+# THE RATE LIMIT IS THE THING TO KNOW: Let's Encrypt allows 5 identical
+# certificates per week. Replacing this instance repeatedly while debugging
+# will hit it, and the lockout lasts days with an error that mentions nothing
+# about instance replacement. If you are iterating on user_data, expect it.
+########################################################
+storage:
+  module: file_system
+  root: /data
+
+apps:
+  tls:
+    certificates:
+      ########################################################
+      # BOTH NAMES, and it is all-or-nothing.
+      #
+      # Caddy requests them as one batch. If either A record is missing or has
+      # not propagated, the ACME challenge for that name fails and takes the
+      # whole batch with it - so a missing TURN record leaves the MAIN name
+      # without a certificate too. Check both resolve before blaming Caddy:
+      #
+      #   dig +short {{ livekit_fqdn }} @1.1.1.1
+      #   dig +short {{ livekit_turn_fqdn }} @1.1.1.1
+      ########################################################
+      automate:
+        - {{ livekit_fqdn }}
+        - {{ livekit_turn_fqdn }}
+
+  layer4:
+    servers:
+      main:
+        listen: [":443"]
+        routes:
+          ########################################################
+          # TURN over TLS. FIRST, because route matching is ordered and the
+          # main-name route below would otherwise be reached by anything.
+          ########################################################
+          - match:
+              - tls:
+                  sni:
+                    - "{{ livekit_turn_fqdn }}"
+            handle:
+              - handler: tls
+              - handler: proxy
+                upstreams:
+                  - dial: ["localhost:{{ livekit_turn_tls_port }}"]
+
+          ########################################################
+          # The LiveKit WebSocket and REST API.
+          #
+          # alpn http/1.1 is load-bearing. Without it Caddy negotiates HTTP/2,
+          # and a WebSocket upgrade over HTTP/2 is a different mechanism that
+          # LiveKit's server does not implement. The failure is a client that
+          # connects, completes TLS, and is then dropped at the upgrade - which
+          # reads as an authentication problem rather than a protocol one.
+          ########################################################
+          - match:
+              - tls:
+                  sni:
+                    - "{{ livekit_fqdn }}"
+            handle:
+              - handler: tls
+                connection_policies:
+                  - alpn: ["http/1.1"]
+              - handler: proxy
+                upstreams:
+                  - dial: ["localhost:{{ livekit_api_port }}"]

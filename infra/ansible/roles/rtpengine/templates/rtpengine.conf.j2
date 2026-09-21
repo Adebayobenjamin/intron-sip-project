@@ -1,0 +1,64 @@
+{{ ansible_managed | comment }}
+[rtpengine]
+
+# ---------------------------------------------------------------------------
+# THE ONE LINE THAT MATTERS.
+#
+#   private/<address it binds to>!<address it puts in SDP>
+#
+# The instance has a single NIC holding {{ ansible_host }}. The Elastic IP
+# {{ kamailio_public_ip }} is mapped 1:1 at the VPC edge and appears nowhere on
+# the box — so it has to be supplied, and it comes from Terraform via the
+# inventory.
+#
+# If the part after `!` is wrong or missing, RTPEngine advertises a 10.x
+# address to a carrier that cannot route to it. Signalling stays clean, the
+# call answers, and there is no audio. Nothing logs an error.
+# ---------------------------------------------------------------------------
+interface = private/{{ ansible_host }}!{{ kamailio_public_ip }}
+
+# Kamailio drives this on every offer/answer. Bound to loopback because
+# Kamailio is on this same box — nothing else may speak ng, and there is
+# deliberately no security group rule for it. Splitting the two daemons onto
+# separate instances means changing this AND adding that rule; forgetting the
+# rule means every call sets up with no media.
+listen-ng = {{ rtpengine_listen_ng }}
+
+# Must match rtpengine_port_min/max in iac/stacks/sip-core. The security group
+# opens a range and RTPEngine allocates inside one; a mismatch is, again, calls
+# that set up with no audio.
+#
+# {{ rtpengine_port_max - rtpengine_port_min }} ports at two per call is about
+# {{ ((rtpengine_port_max - rtpengine_port_min) / 2) | int }} concurrent legs.
+port-min = {{ rtpengine_port_min }}
+port-max = {{ rtpengine_port_max }}
+
+{% if rtpengine_kernel_module %}
+# In-kernel forwarding. See the role's tasks for why this is verified rather
+# than trusted — a DKMS module unbuilt after a kernel upgrade degrades to
+# userspace silently.
+table = {{ rtpengine_table }}
+{% else %}
+# -1 disables kernel forwarding entirely; everything relays in userspace.
+table = -1
+{% endif %}
+
+# One thread per vCPU. Media relay parallelises cleanly, and the work is
+# per-packet rather than per-call.
+num-threads = {{ rtpengine_num_threads }}
+
+# Absorb jitter without adding audible delay. {{ rtpengine_jitter_buffer }}
+# packets at 20ms frames is {{ rtpengine_jitter_buffer * 20 }}ms — near the
+# point where added latency starts to be noticeable in conversation, so treat
+# this as a ceiling rather than something to raise when audio sounds rough.
+jitter-buffer = {{ rtpengine_jitter_buffer }}
+
+# 6 = info. Enough to see call setup and teardown. Raising it on a box relaying
+# all media produces a great deal of output very quickly.
+log-level = {{ rtpengine_log_level }}
+log-stderr = false
+
+# Delete call state as soon as the call ends rather than keeping it for
+# late-arriving packets. On a private network behind a load-balanced edge there
+# is no reordering window worth holding ports open for.
+delete-delay = 0

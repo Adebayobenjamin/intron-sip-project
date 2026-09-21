@@ -1,0 +1,51 @@
+{{ ansible_managed | comment }}
+# Dispatcher destinations, rendered from the inventory.
+#
+# Format: setid destination flags priority attrs
+#
+# GENERATED, NOT MAINTAINED. Adding a FreeSWITCH node is a Terraform count plus
+# a re-run of the kamailio play — this file is never edited by hand, so the
+# inventory and the dispatcher cannot drift apart.
+
+# ---------------------------------------------------------------------------
+# Set {{ kamailio_dispatcher_set_freeswitch }} — the FreeSWITCH farm.
+#
+# Private addresses, because the farm has no other kind. Nothing outside this
+# VPC can reach them, which is the point: every packet in arrives through this
+# proxy.
+#
+# {{ freeswitch_private_ips | length }} node(s) today. With one, ds_next_dst()
+# in the failure route has nowhere to go — failover is a behaviour this
+# environment cannot exercise.
+# ---------------------------------------------------------------------------
+{% for ip in freeswitch_private_ips %}
+{{ kamailio_dispatcher_set_freeswitch }} sip:{{ ip }}:{{ freeswitch_sip_port }} 0 0 duid=fs{{ loop.index }}
+{% endfor %}
+
+# ---------------------------------------------------------------------------
+# Set {{ kamailio_dispatcher_set_livekit }} — livekit-sip, for the AI leg.
+#
+# OVER THE PUBLIC INTERNET, because LiveKit is in a different AWS account. The
+# destination is its public address, and the URI scheme below is not cosmetic:
+#
+#   sips:...;transport=tls   signalling encrypted, media negotiated as SRTP
+#   sip:...                  everything in the clear
+#
+# THE `sips:` FORM IS WHAT MAKES KAMAILIO USE TLS. Writing sip: with a 5061
+# port does NOT upgrade the transport — it sends plain SIP to the TLS port,
+# which the far end drops, and the call fails with no route rather than with
+# anything naming TLS.
+#
+# EMPTY UNTIL livekit_sip_host IS SET. An empty set means ds_select_dst returns
+# no destination and the AI leg fails to connect — the intended failure. A
+# guessed address that happens to resolve would be worse.
+#
+# Migration to a peered VPC changes the HOST only; see docs/LIVEKIT.md.
+# ---------------------------------------------------------------------------
+{% if livekit_sip_host | length > 0 %}
+{% if livekit_sip_transport == 'tls' %}
+{{ kamailio_dispatcher_set_livekit }} sips:{{ livekit_sip_host }}:{{ livekit_sip_port }};transport=tls 0 0 duid=livekit1
+{% else %}
+{{ kamailio_dispatcher_set_livekit }} sip:{{ livekit_sip_host }}:{{ livekit_sip_port }} 0 0 duid=livekit1
+{% endif %}
+{% endif %}

@@ -1,0 +1,36 @@
+{#- ##########################################################################
+  Build-time module list, rendered from freeswitch_modules in the role's
+  defaults so the compiled set, the loaded set (modules.conf.xml) and the
+  post-build assertion all come from one list. Edit defaults/main.yml, not
+  here - that file also carries the reasoning for what is in the list and
+  what is deliberately left out.
+
+  NOTHING BUT MODULE PATHS MAY REACH THE RENDERED FILE. Not a header, not
+  ansible_managed, not a blank-with-# line. That is why this explanation is a
+  Jinja comment, which renders to nothing, rather than the `#` comment it
+  looks like it should be.
+
+  The reason is that src/mod/Makefile.am does not parse modules.conf so much
+  as mangle it (v1.10, lines 21-22):
+
+      ... | grep $$modname$$ | sed -e 's|#||' | head -n 1
+
+  `sed 's|#||'` STRIPS the # character; it does not skip commented lines. And
+  the disabled-module list is built by taking every OTHER line in the file,
+  word by word, and suffixing each word with -all / -clean / -install. So a
+  prose header does not get ignored - every word in it becomes a make target.
+
+  It fails ~25 minutes in, after the core has already built, with
+
+      Makefile:719: *** multiple target patterns.  Stop.
+
+  which names neither this file nor a module. The trigger was one word ending
+  in a colon ("...works at all:") landing in OUR_DISABLED_MODULES as `all:-all`
+  - two colons on a target line. Comment prose without punctuation would have
+  built a few hundred bogus targets and failed differently, or not at all.
+  A `join` rather than a `{% for %}` loop for the same reason: a block tag
+  emits a blank line unless trim_blocks is on, and whether it is on is an
+  Ansible default rather than a property of this file. This renders exactly
+  one line per module under any setting.
+########################################################################## -#}
+{{ freeswitch_modules | join('\n') }}

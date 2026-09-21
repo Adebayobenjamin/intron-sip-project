@@ -1,0 +1,187 @@
+---
+########################################################
+# Docker Engine from Docker's own apt repository.
+#
+# Not Debian's docker.io package: it lags well behind and has differed on the
+# compose plugin in ways that are tedious to discover on a running box.
+########################################################
+
+- name: Create the apt keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Install the Docker apt key
+  ansible.builtin.get_url:
+    url: "{{ docker_apt_repo }}/gpg"
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Add the Docker apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}
+      signed-by=/etc/apt/keyrings/docker.asc]
+      {{ docker_apt_repo }} {{ ansible_distribution_release }} stable
+    filename: docker
+    state: present
+  register: docker_repo
+
+- name: Install Docker Engine
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: "{{ docker_repo.changed }}"
+
+########################################################
+# Daemon configuration.
+#
+# live-restore keeps containers running across a Docker daemon restart, which
+# an apt upgrade of docker-ce will do. Without it, upgrading Docker drops every
+# ESL socket on the box — a deploy of something that is not even the
+# application.
+########################################################
+- name: Configure the Docker daemon
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+    content: |
+      {
+        "log-driver": "{{ docker_log_driver }}",
+        "live-restore": true,
+        "default-ulimits": {
+          "nofile": { "Name": "nofile", "Hard": 65536, "Soft": 65536 }
+        }
+      }
+  notify: restart docker
+
+- name: Enable and start Docker
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+    daemon_reload: true
+
+########################################################
+# ECR authentication.
+#
+# The instance profile grants the pull, but `docker pull` still needs a
+# credential in its own config. A credential helper resolves it per-pull from
+# IMDS instead of a `docker login` whose 12-hour token expires — and the
+# failure mode of the login approach is a deploy that works all day and fails
+# overnight.
+#
+# SKIPPED ENTIRELY WHERE ecr_registry IS UNDEFINED, and that is a real case
+# rather than a defensive default. This role is used by two kinds of host:
+#
+#   control_plane   pulls our own images from ECR. Needs all of this.
+#   livekit         pulls livekit-server, redis and caddy from Docker Hub.
+#                   Has no ECR grant in its instance profile and no reason to.
+#
+# Gating on the variable rather than on the group keeps the role from knowing
+# the inventory's shape: any future host that pulls from ECR gets this by
+# defining ecr_registry, and any host that does not, does not.
+#
+# Before this was conditional the role failed on the livekit box with
+# "'ecr_registry' is undefined" at the config.json task — AFTER Docker was
+# installed and started, so the play was most of the way through and the error
+# pointed at a template rather than at a host that simply does not use ECR.
+########################################################
+- name: Install the ECR credential helper
+  ansible.builtin.apt:
+    name: amazon-ecr-credential-helper
+    state: present
+  register: ecr_helper
+  failed_when: false
+  when: ecr_registry is defined
+
+# Debian 12 carries the helper, but do not depend on that silently — a missing
+# binary here surfaces as an authentication failure on pull, which reads like
+# an IAM problem.
+- name: Fail clearly if the ECR credential helper is unavailable
+  ansible.builtin.fail:
+    msg: >-
+      amazon-ecr-credential-helper could not be installed from apt. Install the
+      binary at /usr/bin/docker-credential-ecr-login from
+      github.com/awslabs/amazon-ecr-credential-helper and re-run. Without it,
+      `docker pull` from ECR fails with an authentication error that looks like
+      an IAM problem and is not.
+  when:
+    - ecr_registry is defined
+    - ecr_helper is failed
+
+- name: Ensure the Docker config directory exists
+  ansible.builtin.file:
+    path: /root/.docker
+    state: directory
+    mode: "0700"
+  when: ecr_registry is defined
+
+# systemd units run as root, so root's docker config is the one that matters.
+# A helper configured only under a login user's home works interactively and
+# fails at boot, which is the worst combination to debug.
+- name: Configure Docker to use the ECR credential helper
+  ansible.builtin.copy:
+    dest: /root/.docker/config.json
+    mode: "0600"
+    content: |
+      {
+        "credHelpers": {
+          "{{ ecr_registry }}": "ecr-login"
+        }
+      }
+  when: ecr_registry is defined
+
+########################################################
+# Prune old images. Immutable tags mean images accumulate on every deploy.
+#
+# Prunes only images not used by a running container, so nothing in service is
+# at risk — but it WILL remove the previous tag, which is the rollback target.
+# Weekly rather than daily for that reason: a rollback window measured in days.
+########################################################
+- name: Install the image prune service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/docker-prune.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Prune unused Docker images
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/docker image prune -af --filter "until=168h"
+  notify: reload systemd
+
+- name: Install the image prune timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/docker-prune.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Prune unused Docker images {{ docker_prune_schedule }}
+
+      [Timer]
+      OnCalendar={{ docker_prune_schedule }}
+      Persistent=true
+      RandomizedDelaySec=1h
+
+      [Install]
+      WantedBy=timers.target
+  notify: reload systemd
+
+- name: Flush handlers so the timer exists before enabling it
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable the image prune timer
+  ansible.builtin.systemd:
+    name: docker-prune.timer
+    state: started
+    enabled: true

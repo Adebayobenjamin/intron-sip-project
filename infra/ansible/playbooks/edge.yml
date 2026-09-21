@@ -1,0 +1,39 @@
+---
+- name: Configure the Kamailio + RTPEngine edge
+  hosts: edge
+  become: true
+
+  ########################################################
+  # serial: 1 so a multi-node edge is never fully down mid-play.
+  #
+  # Does nothing with one node, which is the beta shape — it is here so that
+  # raising edge_count does not also require remembering this. A play that
+  # restarts Kamailio on every edge node simultaneously drops every call on the
+  # platform.
+  ########################################################
+  serial: 1
+
+  pre_tasks:
+    # kamailio_public_ip cannot be discovered on the box — AWS maps the Elastic
+    # IP 1:1 at the VPC edge and the instance only ever sees its private
+    # address. It has to come from Terraform via the inventory, and if it is
+    # missing, Kamailio and RTPEngine both advertise a 10.x address. The call
+    # then sets up perfectly and has no audio, which is a far worse failure
+    # than this assertion.
+    - name: Assert the edge node knows its public address
+      ansible.builtin.assert:
+        that:
+          - kamailio_public_ip is defined
+          - kamailio_public_ip | length > 0
+          - kamailio_public_ip is not match('REPLACE_ME')
+        fail_msg: >-
+          kamailio_public_ip is unset or still a placeholder for
+          {{ inventory_hostname }}. Get it from Terraform:
+          cd infra/iac && make output STACK=sip-core ENV={{ env_name }} TOKEN=...
+          EXTRA="-raw ansible_inventory_hint"
+        success_msg: "Advertising {{ kamailio_public_ip }}"
+
+  roles:
+    - common
+    - rtpengine
+    - kamailio

@@ -1,0 +1,96 @@
+---
+- name: Configure the LiveKit server
+  hosts: livekit
+  become: true
+
+  ########################################################
+  # NOT IN site.yml, and that is deliberate.
+  #
+  # site.yml is the call path: control-plane, then freeswitch, then edge, in
+  # that order because each depends on the one before being ready. LiveKit sits
+  # beside that chain rather than in it - nothing in the SIP path waits on it,
+  # and a call arriving while this box is down fails at the bridge with a cause
+  # rather than at admission.
+  #
+  # Run it on its own. When livekit-sip lands and the edge starts dispatching
+  # here, this moves ahead of `edge` in site.yml for the same reason
+  # control-plane is first: the destination should be accepting before anything
+  # is pointed at it.
+  ########################################################
+
+  pre_tasks:
+    ########################################################
+    # The public address cannot be discovered on the box.
+    #
+    # AWS maps the Elastic IP 1:1 at the VPC edge and the instance only ever
+    # holds its private address - the same trap the edge play asserts against.
+    # LiveKit works around it by querying STUN at startup (use_external_ip),
+    # so this value is not strictly required to boot. It is asserted anyway
+    # because it is what lets the check below compare what LiveKit DISCOVERED
+    # against what AWS actually assigned.
+    ########################################################
+    - name: Assert the node knows its public address
+      ansible.builtin.assert:
+        that:
+          - livekit_public_ip is defined
+          - livekit_public_ip | length > 0
+          - livekit_public_ip is not match('REPLACE_ME')
+        fail_msg: >-
+          livekit_public_ip is unset or still a placeholder for
+          {{ inventory_hostname }}. Get it from Terraform:
+          cd infra/iac && make output STACK=livekit ENV={{ env_name }}
+          EXTRA="-raw ansible_inventory_hint"
+        success_msg: "Elastic IP {{ livekit_public_ip }}"
+
+    ########################################################
+    # The A record must point at THIS instance.
+    #
+    # A stale record - left over from a replaced instance, or pointing at
+    # Intron's eu-west-2 box - produces a certificate that issues against
+    # somebody else's server and an agent that connects somewhere unexpected.
+    # Both look like success. This is the cheapest place to catch it.
+    ########################################################
+    - name: Resolve the public name
+      ansible.builtin.command: "getent ahostsv4 {{ livekit_fqdn }}"
+      register: livekit_name_lookup
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the public name points at this instance
+      ansible.builtin.assert:
+        that:
+          - livekit_public_ip in livekit_name_lookup.stdout
+        fail_msg: >-
+          {{ livekit_fqdn }} does not resolve to {{ livekit_public_ip }}.
+          Either the Route53 record is stale, or the NS delegation from the
+          parent domain points somewhere else. Resolved instead to:
+          {{ livekit_name_lookup.stdout_lines | default(['nothing']) | join(' ') }}
+        success_msg: "{{ livekit_fqdn }} -> {{ livekit_public_ip }}"
+      when: livekit_name_lookup.rc == 0
+
+  roles:
+    - common
+    - docker
+    - livekit
+
+  post_tasks:
+    ########################################################
+    # What to hand over, printed where it will be seen.
+    #
+    # Two of these three values go to a DIFFERENT COMPANY, into a .env on a box
+    # in another AWS account. The third goes into our own Secrets Manager
+    # container. Getting them out of the play rather than out of a wiki is how
+    # they stay right.
+    ########################################################
+    - name: Integration values
+      ansible.builtin.debug:
+        msg:
+          - "LIVEKIT_URL  = wss://{{ livekit_fqdn }}"
+          - "LIVEKIT_API_KEY / LIVEKIT_API_SECRET = in intron-sip/{{ env_name }}/livekit (never printed)"
+          - ""
+          - "For Intron: a second copy of their agent unit with those three values changed."
+          - "Their agent name is intron_convobot_agent_2 - any dispatch rule we add must match it."
+          - ""
+          - "To test without SIP: generate a token with `lk token create --join --room test --identity me`"
+          - "and open https://agents-playground.livekit.io pointed at the URL above."
+      run_once: true

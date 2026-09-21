@@ -1,0 +1,82 @@
+{{ ansible_managed | comment }}
+# intron-{{ item.name }} — container from ECR, run by systemd.
+#
+# Not docker-compose and not `docker run -d`. Type=exec with the container in
+# the foreground means systemd owns the process: it sees the real exit status,
+# restarts on failure, and — the part that matters here — always runs ExecStop
+# before killing anything.
+
+[Unit]
+Description=Intron {{ item.name }}
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+# Give up restarting after 5 failures in 10 minutes rather than looping
+# forever. A container crash-looping on a bad image tag is noisy and hides
+# whatever else is wrong; a unit in `failed` state is visible.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+Restart=on-failure
+RestartSec=5
+
+# Environment for the ExecStartPre hooks below. AWS_REGION is needed because
+# the CLI has no other source for it inside a systemd unit — there is no
+# profile and no shell rc.
+Environment=AWS_REGION={{ aws_region }}
+Environment=IMAGE={{ ecr_registry }}/{{ item.repository }}:{{ item.image_tag }}
+
+# ---- Secrets -------------------------------------------------------------
+# Fetch from Secrets Manager and render {{ item.name }}.env.tpl -> .env.
+#
+# Runs at EVERY start, so a rotated credential is picked up by `systemctl
+# restart` with no Ansible run. Fails closed: if the fetch fails or the secret
+# is missing a key, the unit does not start, rather than starting with a
+# literal ${PLACEHOLDER} as a password.
+ExecStartPre=/usr/local/bin/fetch-and-render-secrets.sh {{ item.secret_id }} {{ app_config_root }}/{{ item.name }}
+
+# ---- Image ---------------------------------------------------------------
+# Pull before run. With immutable tags this is a no-op after the first pull of
+# a given tag, so it costs nothing on a restart and guarantees the image is
+# present after a deploy bumped the tag.
+ExecStartPre=-/usr/bin/docker rm -f intron-{{ item.name }}
+ExecStartPre=/usr/bin/docker pull ${IMAGE}
+
+# ---- Run -----------------------------------------------------------------
+# --network host, deliberately.
+#
+# Bridge networking would put a NAT between the ESL listener and the world,
+# and the controller identifies WHICH FreeSWITCH node opened each socket from
+# the source address. Behind docker's bridge every connection appears to come
+# from the gateway, and that identification silently stops working — which is
+# also why preserve_client_ip is on at the target group. Host networking keeps
+# the real source address all the way to the application.
+ExecStart=/usr/bin/docker run --rm --name intron-{{ item.name }} \
+  --network host \
+  --env-file {{ app_config_root }}/{{ item.name }}/{{ item.name }}.env \
+  --log-driver {{ docker_log_driver }} \
+  ${IMAGE}
+
+{% if item.long_lived_connections | default(false) %}
+# ---- Stop --------------------------------------------------------------
+# This service holds a TCP socket for the life of every call it is handling.
+# There is no load balancer to drain to (see the role's tasks), so stopping it
+# ENDS THOSE CALLS. Docker sends SIGTERM and waits; the grace period below is
+# the app's chance to close sockets cleanly and flush state rather than being
+# killed mid-write.
+#
+# Make the container handle SIGTERM. Without that this timeout just delays a
+# SIGKILL by two minutes and changes nothing.
+TimeoutStopSec={{ app_stop_grace_seconds }}
+{% else %}
+# Ordinary HTTP. Requests in flight are milliseconds.
+TimeoutStopSec=60
+{% endif %}
+
+ExecStopPost=-/usr/bin/docker rm -f intron-{{ item.name }}
+
+[Install]
+WantedBy=multi-user.target

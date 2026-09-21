@@ -1,0 +1,157 @@
+---
+########################################################
+# LiveKit server — the AI leg, in our own account.
+#
+# WHY THIS BOX EXISTS rather than using Intron's existing LiveKit.
+#
+# Intron's deployment (Calls05, eu-west-2) is a GPU voice worker that only
+# dials OUT: no inbound trunk, no dispatch rule, its SIP proxy trusts a
+# hardcoded carrier IP list that excludes our edge, and its SIP leg is plain
+# UDP with SRTP disabled. Pointing this platform at it would mean changing all
+# four on a box carrying live calls.
+#
+# THE MODELS STAY WHERE THEY ARE. A LiveKit agent is a CLIENT: it opens a
+# WebSocket outward to whichever server its environment names and waits for
+# work. Adopting this server costs Intron a second systemd unit with three
+# environment variables changed — no firewall rule, no SIP change, nothing
+# inbound to their GPU box.
+#
+# So there is no GPU here and there does not need to be. LiveKit forwards RTP;
+# it does not decode, mix or run a model.
+########################################################
+
+########################################################
+# The public names. BOTH come from Terraform:
+#
+#   cd infra/iac
+#   make output STACK=livekit ENV=beta EXTRA="-raw livekit_fqdn"
+#   make output STACK=livekit ENV=beta EXTRA="-raw livekit_turn_fqdn"
+#
+# livekit_fqdn is the one that leaves this repo — it becomes LIVEKIT_URL in
+# Intron's agent .env and in our own esl-controller secret, as
+# wss://<livekit_fqdn>.
+#
+# TWO NAMES FOR ONE BOX is not a mistake. Caddy serves both the LiveKit
+# WebSocket and TURN-over-TLS on 443, because 443 is the one port a restrictive
+# network reliably permits, and it tells them apart by TLS SNI. SNI carries a
+# hostname, so two services on one port need two names.
+########################################################
+livekit_fqdn: livekit-beta.intron.quiverlearn.com
+livekit_turn_fqdn: livekit-beta-turn.intron.quiverlearn.com
+
+########################################################
+# Ports. EVERY ONE HAS A MATCHING SECURITY GROUP RULE in
+# iac/stacks/livekit/_main/security-groups.tf.
+#
+# Terraform opens what these bind to, from a different file. A mismatch does
+# not announce itself: the call connects, both participants appear in the room,
+# and there is no audio. Nothing in any log names a port. Change these in both
+# places or not at all.
+########################################################
+livekit_api_port: 7880
+livekit_rtc_tcp_port: 7881
+livekit_rtc_udp_port_min: 50000
+livekit_rtc_udp_port_max: 60000
+livekit_turn_udp_port: 3478
+
+# TURN RELAY range, distinct from the port above: 3478 is where a relay is
+# REQUESTED, this range is where it CARRIES MEDIA. Opening only 3478 gives a
+# TURN server that negotiates cleanly and relays into a dropped port — audio
+# never arrives, and only for the clients that needed TURN at all.
+livekit_turn_relay_port_min: 30000
+livekit_turn_relay_port_max: 40000
+
+########################################################
+# Image tags, pinned.
+#
+# LiveKit's agent protocol and SIP support both move between releases, and
+# "the server upgraded itself overnight" is not a thing to discover during a
+# call outage. Bump deliberately.
+#
+# PIN CURRENT, NOT OLD — v1.13.7 is the latest stable (Sep 2026). This was
+# v1.9.1 and the browser client could not connect at all:
+#
+#   invalid token: ... proto: unknown field "tags"
+#
+# The client signs a token whose roomConfig claim carries a field the server's
+# protobuf does not know, and the server rejects the token whole. It presents
+# as an auth failure — wrong secret, clock skew — and is neither.
+#
+# WHY FORWARD IS SAFE FOR INTRON. Their box runs livekit-server 1.12.0, but
+# that is THEIR server; what talks to ours is their AGENT SDK, and a newer
+# server accepts an older client. Unknown fields only break in the direction
+# where the client is ahead of the server, which is exactly what bit us.
+########################################################
+livekit_server_image: livekit/livekit-server:v1.13.7
+livekit_redis_image: redis:7-alpine
+livekit_caddy_image: livekit/caddyl4:v2.11.3
+
+########################################################
+# Room teardown delay.
+#
+# 3 seconds rather than the stock 20. Intron hit this on their own deployment:
+# at 20s a caller who hangs up leaves the room alive and the agent holding its
+# session, producing about twenty seconds of dead air and a session duration in
+# the call record that bears no relation to the conversation.
+########################################################
+livekit_room_departure_timeout: 3
+
+# info rather than debug. Intron's SIP container runs at debug and its output
+# is dominated by per-packet ICE and SCTP lines — exactly what you do not want
+# to page through looking for a room event.
+livekit_log_level: info
+
+########################################################
+# livekit-sip — where a phone call becomes a room participant.
+#
+# THIS IS WHAT REPLACED THE OLD DESIGN. docs/LIVEKIT.md used to describe our
+# Kamailio dialling Intron's LiveKit across the public internet, which is why
+# it specified SIP-TLS on 5061 with SRTP required. Running livekit-sip in our
+# own VPC removes that leg entirely: SIP and RTP go edge -> here over private
+# addresses, so there is no certificate to agree between two estates and no
+# audio crossing the internet in the clear.
+#
+# The security group takes the EDGE SECURITY GROUP as its source, not a CIDR
+# and certainly not 0.0.0.0/0 like the WebRTC ports.
+########################################################
+livekit_sip_enabled: true
+livekit_sip_listen_port: 5060
+
+# SIP-side RTP. A DIFFERENT RANGE from livekit_rtc_udp_port_*, which carries
+# WebRTC to browsers and to Intron's agent. Two media paths meet inside
+# livekit-sip; sharing one range gives audio in one direction only.
+livekit_sip_rtp_port_min: 10000
+livekit_sip_rtp_port_max: 20000
+
+########################################################
+# Who may present calls on the inbound trunk.
+#
+# The edge's private address. This is the SECOND of two locks — the security
+# group already restricts who can reach port 5060 — and it is worth having
+# because the two are written against different things (a security group, and
+# an address) and fail independently.
+#
+# Taken from the edge host in hosts.yml rather than written twice.
+########################################################
+livekit_sip_allowed_addresses:
+  - "{{ hostvars['beta-edge-1'].ansible_host }}/32"
+
+########################################################
+# ROOM NAMING — A CONTRACT WITH INTRON'S AGENT, NOT A LABEL.
+#
+# Their agent does `str(room_name).split("__")` and reads element [1] as the
+# caller's number, so the composed room name must contain "__" before it. The
+# trailing underscore below is there so LiveKit's own separator completes the
+# pair.
+#
+# VERIFY ON THE FIRST REAL CALL and do not assume: compare the room name in
+# the LiveKit log against SESSION_PHONE_NUMBER in the agent log. "unknown"
+# means the composition differs and this one variable needs changing. The
+# agent still answers either way, which is what makes it easy to miss.
+########################################################
+livekit_sip_room_prefix: intron_sip
+
+# Intron's worker registers under this name. Because their code sets
+# agent_name, automatic dispatch is OFF — the dispatch rule must name the
+# agent or the caller lands in a room with nobody in it.
+livekit_sip_agent_name: intron_convobot_agent_2

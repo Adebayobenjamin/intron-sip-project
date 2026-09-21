@@ -1,0 +1,5 @@
+---
+app_config_root: /etc/intron
+# SIGTERM grace period, not a drain - there is no load balancer to drain to.
+app_stop_grace_seconds: 120
+app_services: []

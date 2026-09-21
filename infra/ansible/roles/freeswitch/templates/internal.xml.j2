@@ -1,0 +1,67 @@
+<!-- {{ ansible_managed }} -->
+<!--
+  The ONLY SIP profile on this node. The vanilla external / *-ipv6 profiles are
+  removed by the role: each one binds a port, runs its own thread set and keeps
+  its own sofia registration database for zero calls.
+
+  Everything here is private-side. This box has no public address, and every
+  packet that reaches it came through the Kamailio edge.
+-->
+<profile name="internal">
+  <settings>
+    <param name="sip-ip" value="{{ ansible_host }}"/>
+    <param name="rtp-ip" value="{{ ansible_host }}"/>
+    <param name="sip-port" value="{{ freeswitch_sip_port }}"/>
+
+    <!--
+      ext-* pinned to the PRIVATE address, deliberately.
+
+      Vanilla resolves these via STUN, which on a box with no public networking
+      discovers the NAT gateway's address and advertises something nothing can
+      reach. The public-facing rewrite is RTPEngine's job at the edge, not
+      FreeSWITCH's — the farm should never put an address in an SDP that leaves
+      the VPC.
+    -->
+    <param name="ext-sip-ip" value="{{ ansible_host }}"/>
+    <param name="ext-rtp-ip" value="{{ ansible_host }}"/>
+
+    <param name="context" value="public"/>
+    <param name="dialplan" value="XML"/>
+
+    <!--
+      Codec order. PCMU/PCMA first: the carrier leg is almost always G.711 and
+      transcoding costs CPU on the box that can least afford it. OPUS is here
+      for the LiveKit leg, where it is worth paying for.
+    -->
+    <param name="inbound-codec-prefs" value="{{ freeswitch_codecs | join(',') }}"/>
+    <param name="outbound-codec-prefs" value="{{ freeswitch_codecs | join(',') }}"/>
+    <param name="inbound-late-negotiation" value="true"/>
+
+    <!--
+      Reap channels whose media has stopped. Correctness, not capacity: with no
+      timeout, a channel whose RTP dries up — the far end vanished, the carrier
+      dropped it without a BYE — is held FOREVER, counting against max-sessions
+      and against the RTP port range. The symptom is call setup failing at a
+      volume the box handled fine last week.
+    -->
+    <param name="rtp-timeout-sec" value="{{ freeswitch_rtp_timeout_sec }}"/>
+    <param name="rtp-hold-timeout-sec" value="{{ freeswitch_rtp_hold_timeout_sec }}"/>
+
+    <!--
+      No registration and no authentication on this profile. Nothing registers
+      here: the only source of calls is the Kamailio edge, which has already
+      authenticated the carrier and run the admission check. Accepting
+      registrations would mean a second, unauthenticated way in.
+    -->
+    <param name="auth-calls" value="false"/>
+    <param name="accept-blind-reg" value="false"/>
+    <param name="accept-blind-auth" value="false"/>
+
+    <!-- Kamailio Record-Routes, so in-dialog requests come back through it. -->
+    <param name="aggressive-nat-detection" value="false"/>
+    <param name="apply-nat-acl" value="none"/>
+
+    <param name="manage-presence" value="false"/>
+    <param name="disable-transcoding" value="false"/>
+  </settings>
+</profile>

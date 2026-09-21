@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+#
+# db-dsn-to-sm — compose DATABASE_URL from the RDS-managed password secret and
+# merge it into the Secrets Manager containers that need it.
+#
+# Usage:
+#   db-dsn-to-sm <env> [--print]
+#
+# WHY THIS EXISTS.
+# The RDS instance is created with manage_master_user_password, so RDS
+# generates the password and holds it in its own secret. Terraform never sees
+# the value and it never lands in state - which is the whole point, since state
+# keeps every historical version forever.
+#
+# The applications, though, read their own containers
+# for all of its config, the same way every other service in this repo does.
+# Giving it a second code path and a second IAM grant just for the database
+# would be a worse trade than one operator command.
+#
+# So: this reads the endpoint from Terraform state and the password from the
+# RDS secret, assembles a DSN in memory, and MERGES it into the control-plane
+# and esl-controller
+# container. Nothing touches disk and nothing is echoed unless --print is given.
+#
+# RE-RUN IT IF THE PASSWORD ROTATES. RDS can rotate the managed secret; this
+# DSN does not follow automatically, and the symptom is the control-plane API
+# failing to authenticate after a rotation window.
+#
+# Run from infra/bin, infra/iac, or anywhere - paths are resolved from the
+# script's own location.
+
+set -euo pipefail
+
+ENV_NAME="${1:-}"
+PRINT="${2:-}"
+
+if [[ -z "$ENV_NAME" ]]; then
+  echo "usage: db-dsn-to-sm <env> [--print]" >&2
+  exit 2
+fi
+
+for bin in aws jq terraform; do
+  command -v "$bin" >/dev/null || { echo "db-dsn-to-sm: '$bin' not found in PATH" >&2; exit 127; }
+done
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STACK_DIR="$HERE/../iac/stacks/database/$ENV_NAME"
+[[ -d "$STACK_DIR" ]] || { echo "db-dsn-to-sm: no database stack at $STACK_DIR" >&2; exit 1; }
+
+export AWS_PROFILE="${AWS_PROFILE:-klarity_aws}"
+export AWS_REGION="${AWS_REGION:-eu-central-1}"
+
+# --- Read the non-secret pieces from Terraform state ----------------------
+
+read_output() {
+  terraform -chdir="$STACK_DIR" output -raw "$1" 2>/dev/null
+}
+
+DB_HOST="$(read_output db_address)"
+DB_PORT="$(read_output db_port)"
+DB_NAME="$(read_output db_name)"
+DB_USER="$(read_output master_username)"
+SECRET_ARN="$(read_output master_user_secret_arn)"
+
+for v in DB_HOST DB_PORT DB_NAME DB_USER SECRET_ARN; do
+  if [[ -z "${!v}" || "${!v}" == "null" ]]; then
+    echo "db-dsn-to-sm: could not read '$v' from the database stack." >&2
+    echo "  Has it been applied?  make apply STACK=database ENV=$ENV_NAME" >&2
+    exit 1
+  fi
+done
+
+# --- Password, straight from the RDS-managed secret -----------------------
+
+if ! secret_json=$(aws secretsmanager get-secret-value \
+      --secret-id "$SECRET_ARN" --query SecretString --output text 2>&1); then
+  echo "db-dsn-to-sm: could not read the RDS-managed secret: $secret_json" >&2
+  exit 1
+fi
+
+DB_PASS=$(jq -r '.password' <<<"$secret_json")
+if [[ -z "$DB_PASS" || "$DB_PASS" == "null" ]]; then
+  echo "db-dsn-to-sm: the RDS secret has no 'password' field" >&2
+  exit 1
+fi
+
+# Percent-encode anything that would break the URI. RDS generates passwords
+# containing punctuation, and an unescaped '@' or '/' silently truncates the
+# DSN into something that parses and points somewhere else.
+DB_PASS_ENC=$(jq -rn --arg p "$DB_PASS" '$p|@uri')
+DB_USER_ENC=$(jq -rn --arg u "$DB_USER" '$u|@uri')
+
+# sslmode=require, not the libpq default of prefer. The data subnets have no
+# internet route and the security group admits only the app tier, but "prefer"
+# silently accepts an unencrypted connection if the server offers one - and a
+# silent downgrade is not a thing to leave available on a link carrying tenant
+# and trunk configuration.
+DSN="postgresql://${DB_USER_ENC}:${DB_PASS_ENC}@${DB_HOST}:${DB_PORT}/${DB_NAME}?sslmode=require"
+
+if [[ "$PRINT" == "--print" ]]; then
+  echo "$DSN"
+  exit 0
+fi
+
+# --- Merge into BOTH containers that hold a database credential -----------
+#
+# TWO CONSUMERS NOW, NOT ONE. The ESL controller reads and writes Postgres
+# directly - admission and every call-state write - rather than asking the
+# control-plane API over HTTP (docs/API.md, Contracts 1 and 2). So it needs the
+# same DSN, and a DSN written to only one of them leaves the other unable to
+# start with an error that names the database rather than this script.
+#
+# MERGE, not overwrite. Each container also holds keys this script knows
+# nothing about - the control plane has JWT_SIGNING_KEY and the Twilio
+# credentials, the controller has FREESWITCH_ESL_PASSWORD and the LiveKit keys.
+# A put-secret-value carrying only DATABASE_URL would silently delete them.
+
+for component in control-plane esl-controller; do
+  TARGET="intron-sip/${ENV_NAME}/${component}"
+
+  existing='{}'
+  if current=$(aws secretsmanager get-secret-value --secret-id "$TARGET" \
+        --query SecretString --output text 2>/dev/null); then
+    if jq -e 'type == "object"' >/dev/null 2>&1 <<<"$current"; then
+      existing="$current"
+    else
+      echo "db-dsn-to-sm: $TARGET exists but is not a JSON object - refusing to overwrite it" >&2
+      exit 1
+    fi
+  fi
+
+  merged=$(jq --arg dsn "$DSN" '. + {DATABASE_URL: $dsn}' <<<"$existing")
+
+  aws secretsmanager put-secret-value \
+    --secret-id "$TARGET" \
+    --secret-string "$merged" \
+    --output json --query '{Name:Name,VersionId:VersionId}'
+
+  kept=$(jq -r 'keys | join(", ")' <<<"$merged")
+  echo "db-dsn-to-sm: DATABASE_URL -> $TARGET"
+  echo "  container now holds: ${kept}"
+done
+
+echo "db-dsn-to-sm: host ${DB_HOST}:${DB_PORT}/${DB_NAME}  user ${DB_USER}  sslmode=require"

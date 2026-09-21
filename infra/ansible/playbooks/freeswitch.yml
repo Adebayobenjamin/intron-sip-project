@@ -1,0 +1,14 @@
+---
+- name: Configure the FreeSWITCH farm
+  hosts: freeswitch
+  become: true
+
+  # One node at a time. On a first run this makes an already-slow play slower
+  # (the source build is serialised), but a farm-wide simultaneous restart
+  # drops every call in progress — and the day that matters is not the day to
+  # discover the play does it.
+  serial: 1
+
+  roles:
+    - common
+    - freeswitch

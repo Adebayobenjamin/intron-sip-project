@@ -1,0 +1,46 @@
+---
+########################################################
+# Disposable Asterisk PBX — the far end of a human handoff, for testing.
+#
+# NOT PART OF site.yml, on purpose. This is scaffolding: it stands in for a
+# client's contact-centre SBC until a real one exists, and a `site.yml` that
+# configures it would make a test rig look like a platform tier.
+#
+#   make play PLAYBOOK=test-pbx ENV=beta \
+#     EXTRA_VARS='test_pbx_agent_password=<from openssl rand -base64 24>'
+#
+# Prerequisites:
+#   1. cd infra/iac && make apply STACK=test-pbx ENV=beta \
+#        EXTRA='-var=operator_cidrs=["<your ip>/32"]'
+#   2. Paste `make output STACK=test-pbx ENV=beta EXTRA="-raw
+#      ansible_inventory_hint"` into inventories/<env>/hosts.yml
+#
+# Tear the whole thing down when the real SBC arrives:
+#   cd infra/iac && make destroy STACK=test-pbx ENV=beta
+########################################################
+- name: Configure the disposable test PBX
+  hosts: test_pbx
+  become: true
+
+  pre_tasks:
+    ########################################################
+    # The edge's public address, resolved from the inventory rather than typed.
+    #
+    # Asterisk identifies the Intron edge by SOURCE ADDRESS - it is the only
+    # thing distinguishing a handoff INVITE from an unauthenticated stranger.
+    # Taking it from the edge group means it cannot drift from what sip-core
+    # actually assigned.
+    ########################################################
+    - name: Resolve the Intron edge public address from the inventory
+      ansible.builtin.set_fact:
+        intron_edge_public_ip: >-
+          {{ hostvars[groups['edge'][0]].kamailio_public_ip }}
+      when: intron_edge_public_ip is not defined
+
+  roles:
+    # `common` gives the AWS CLI, base diagnostics and the timezone. It does
+    # NOT give sngrep here - that is scoped to the SIP tiers via
+    # common_extra_packages, and this box is not one of them. Set it in
+    # group_vars if you want sngrep on the PBX too.
+    - common
+    - test-pbx

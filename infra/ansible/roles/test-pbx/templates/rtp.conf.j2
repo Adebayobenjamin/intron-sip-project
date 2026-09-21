@@ -1,0 +1,19 @@
+{{ ansible_managed | comment }}
+;
+; RTP port range.
+;
+; MUST MATCH rtp_port_min / rtp_port_max in iac/stacks/test-pbx. The security
+; group opens a range and Asterisk allocates within one — and a mismatch is
+; not a config error that reports itself. The call sets up cleanly, both ends
+; believe they are connected, and there is no audio.
+;
+; If you widen one, widen the other in the same change.
+
+[general]
+rtpstart={{ test_pbx_rtp_port_min }}
+rtpend={{ test_pbx_rtp_port_max }}
+
+; Keep the media flowing through NAT on the agent's side. Linphone on a
+; domestic connection goes quiet when the far end is on hold, and some routers
+; reap the mapping.
+rtpkeepalive=15

@@ -1,0 +1,106 @@
+---
+########################################################
+# Kamailio + RTPEngine, co-located on the edge box.
+########################################################
+
+# Kamailio from the project's own apt repository rather than Debian's, which
+# ships a version well behind and without several modules this config needs.
+kamailio_version: "5.8"
+kamailio_repo_distro: bookworm
+
+# Modules the config actually loads. Listed here rather than inferred from the
+# config, because Debian splits Kamailio across a package per module group and
+# a missing one fails at STARTUP with "cannot load module", after the play has
+# already reported success.
+kamailio_modules:
+  - kamailio-extra-modules   # dispatcher, htable, rtpengine
+  - kamailio-tls-modules     # SIP over TLS on 5061
+  - kamailio-json-modules    # the control-plane routing lookup speaks JSON
+  - kamailio-utils-modules   # http_client, for that same lookup
+  - kamailio-presence-modules
+
+########################################################
+# RTPEngine.
+#
+# THE ADVERTISED ADDRESS IS THE WHOLE GAME ON AWS.
+#
+# An Elastic IP is mapped 1:1 at the VPC edge; the instance only ever sees its
+# private 10.70.0.x address on a single NIC. So RTPEngine has to be told the
+# public address explicitly — it cannot find it, and there is nothing on the
+# box that hints at it.
+#
+#   interface = private/PRIVATE_IP!PUBLIC_IP
+#
+# Get it wrong and the SDP RTPEngine rewrites offers a 10.x address to a
+# carrier that cannot route there. The call sets up cleanly, signalling looks
+# perfect end to end, and there is no audio in either direction. It is the
+# single most common way to lose a day on AWS SIP.
+#
+# kamailio_public_ip is per-host in hosts.yml, sourced from Terraform's
+# edge_public_ips output.
+########################################################
+rtpengine_listen_ng: "127.0.0.1:{{ rtpengine_ng_port }}"
+rtpengine_interface: "private/{{ ansible_host }}!{{ kamailio_public_ip }}"
+
+# Must match rtpengine_port_min/max in iac/stacks/sip-core — the security group
+# opens a range and RTPEngine allocates inside one. A mismatch is, again,
+# one-way or no audio with clean signalling.
+rtpengine_port_min: "{{ hostvars[inventory_hostname]['rtpengine_port_min'] | default(30000) }}"
+rtpengine_port_max: "{{ hostvars[inventory_hostname]['rtpengine_port_max'] | default(40000) }}"
+
+# In-kernel forwarding. Roughly an order of magnitude more packets per second
+# than userspace, because relayed packets never cross into user memory.
+#
+# The cost is a DKMS module built against the running kernel, which means a
+# kernel upgrade can leave the module unbuilt and RTPEngine silently falling
+# back to userspace. The role asserts the module is loaded rather than assuming
+# — a fallback that goes unnoticed shows up later as packet loss under load
+# that looks like an instance-size problem.
+rtpengine_kernel_module: true
+rtpengine_table: 0
+
+# Absorb jitter without adding meaningful delay. 10 packets at 20ms frames is
+# 200ms of buffer — beyond the point where added latency starts to be audible
+# in a conversation, so this is a ceiling rather than a target.
+rtpengine_jitter_buffer: 10
+
+########################################################
+# Dual role on one box: RTPEngine relays media for every call while Kamailio
+# needs predictable latency on a small number of signalling packets. The
+# network-buffer tuning in the common role matters more here than anywhere
+# else in the fleet.
+########################################################
+tune_network_buffers: true
+
+# Kamailio does not call setsockopt(SO_RCVBUF), so every UDP socket it opens
+# inherits net.core.rmem_default — rmem_max is only a ceiling for a process
+# that asks, and Kamailio does not ask. Setting default equal to max is
+# therefore the setting that actually takes effect.
+#
+# TAKES EFFECT ON NEW SOCKETS ONLY. A running Kamailio keeps the buffer size it
+# started with, so this needs a restart to reach the SIP sockets — and a
+# restart drops every registration.
+network_rmem_max: 16777216
+network_rmem_default: 16777216
+network_wmem_max: 16777216
+
+########################################################
+# SIP diagnostics, on this tier only.
+#
+# sngrep reads the same packets tcpdump does but understands SIP: it groups
+# them into CALLS, so you get a ladder diagram of one dialog rather than a flat
+# packet list. The questions that actually come up here are dialog-shaped —
+# which leg sent the BYE, what the far end answered with, what address ended up
+# in the SDP — and reassembling those from raw tcpdump output, over an SSM
+# session, during an incident, is the wrong time to be doing it.
+#
+# BOTH SIP TIERS, not just the edge. A call crosses carrier -> Kamailio ->
+# FreeSWITCH and back out; having the tool at one end of a two-ended problem
+# means apt-installing on the other end mid-incident. The app tier is
+# deliberately excluded — it speaks ESL and HTTP, never SIP.
+#
+#   sngrep -d any port 5060        live
+#   sngrep -I capture.pcap         read back a tcpdump file
+########################################################
+common_extra_packages:
+  - sngrep

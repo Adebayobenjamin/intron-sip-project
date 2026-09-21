@@ -1,0 +1,86 @@
+{{ ansible_managed | comment }}
+
+[Unit]
+Description=FreeSWITCH
+After=network-online.target
+Wants=network-online.target
+
+# StartLimit* BELONG IN [Unit], NOT [Service].
+#
+# They were in [Service], where systemd ignores them with a warning that only
+# appears in the journal at load time:
+#
+#   /etc/systemd/system/freeswitch.service:44: Unknown key
+#   'StartLimitIntervalSec' in section [Service], ignoring.
+#
+# So the rate limit silently did not exist: a FreeSWITCH that crashed on a bad
+# config would have restarted every 10s forever instead of giving up after 3
+# tries, and `systemctl status` would have shown it cheerfully "activating"
+# rather than failed. Moved in systemd 229; this box runs 252.
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=forking
+User=freeswitch
+Group=freeswitch
+Environment=AWS_REGION={{ aws_region }}
+
+# Render event_socket.conf.xml from its .tpl before FreeSWITCH parses config.
+#
+# At EVERY start, so a rotated ESL password is picked up by `systemctl restart`
+# with no Ansible run. FAILS CLOSED: if the Secrets Manager fetch fails, the
+# unit does not start — rather than starting with a literal
+# ${FREESWITCH_ESL_PASSWORD} as the ESL password, which would leave a full
+# remote-control interface for the switch accepting a known string.
+ExecStartPre=/usr/local/bin/fetch-and-render-secrets.sh {{ freeswitch_secret_id }} {{ freeswitch_conf }} freeswitch:freeswitch
+
+# fs_cli credentials. The leading "+" runs this as root regardless of User=
+# above, which it needs in order to write /etc/fs_cli.conf as root:freeswitch
+# 0640 — the point of the file being that the password is NOT passed as an
+# argument, where /proc/<pid>/cmdline would make it world-readable.
+#
+# FS_CLI_HOST is this node's private address because event_socket.conf.xml
+# binds listen-ip there, not to loopback. fs_cli's own default of 127.0.0.1
+# cannot connect at all on this box.
+#
+# NOT fail-closed, unlike the fetch above, and deliberately: a missing
+# /etc/fs_cli.conf costs an operator convenience, while refusing to start the
+# switch over it would turn a broken debugging tool into dropped calls.
+Environment=FS_CLI_HOST={{ ansible_host }}
+Environment=FS_CLI_PORT={{ freeswitch_esl_inbound_port }}
+ExecStartPre=+-/usr/local/bin/render-fs-cli-conf.sh {{ freeswitch_secret_id }}
+
+ExecStart={{ freeswitch_prefix }}/bin/freeswitch -ncwait -nonat -rp
+ExecReload={{ freeswitch_prefix }}/bin/fs_cli -x reloadxml
+
+# -nonat: no UPnP/NAT-PMP discovery at start. This box has no public
+# networking, so the discovery is a delay for an answer nothing uses.
+# -rp: enable realtime priority, which the limits.d file permits.
+
+# A FreeSWITCH restart drops every call on THIS node. There is no graceful
+# drain, which is why playbooks/freeswitch.yml sets serial: 1 — a farm-wide
+# simultaneous restart drops every call on the platform.
+#
+# 120s to shut down: FreeSWITCH writes its sqlite databases and flushes CDRs on
+# the way out, and a SIGKILL partway through leaves a corrupted core.db that
+# fails the NEXT start.
+TimeoutStopSec=120
+KillSignal=SIGTERM
+
+Restart=on-failure
+RestartSec=10
+# StartLimitIntervalSec / StartLimitBurst are in [Unit] above — see the note
+# there. Putting them here is accepted by the file and ignored by systemd.
+
+# Two file descriptors per RTP session plus SIP sockets and the sqlite handles.
+# The systemd default is far below the configured session ceiling.
+LimitNOFILE=100000
+LimitNPROC=60000
+LimitRTPRIO=infinity
+LimitRTTIME=infinity
+LimitMEMLOCK=infinity
+LimitCORE=infinity
+
+[Install]
+WantedBy=multi-user.target

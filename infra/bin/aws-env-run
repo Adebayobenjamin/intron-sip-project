@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+#
+# aws-env-run — fetch a JSON secret from AWS Secrets Manager, export its keys
+# as environment variables, and exec a command.
+#
+# The secret value must be a JSON object whose top-level keys are env-var
+# names. Values are stringified before export. The secret only lives in this
+# process's memory and the child's environment — nothing is written to disk.
+#
+# This is how TF_VAR_* values reach Terraform without a tfvars file on disk:
+#   aws-env-run intron-sip/beta/iac -- terraform plan
+#
+# Usage:
+#   aws-env-run <secret-id> [--] <cmd> [args...]
+#
+# AWS authentication defaults to the klarity_aws profile in eu-central-1, the
+# same identity the Makefiles and every Terraform provider block name. Override
+# with AWS_PROFILE / AWS_REGION. See the Identity block below.
+#
+# NOT bin/with-mfa. That wrapper has been deleted — it fetched STS session
+# credentials and unset AWS_PROFILE, which is incompatible with naming a
+# profile explicitly: an explicit profile overrides environment credentials, so
+# the MFA session was silently ignored while appearing to be in use. If the
+# identity ever gains a RequireMFA policy, add an assume-role profile with
+# `mfa_serial` to ~/.aws/config and point AWS_PROFILE at it; the SDK prompts
+# and caches the session itself. See the long note in iac/Makefile.
+
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+  cat >&2 <<'USAGE'
+usage: aws-env-run <secret-id> [--] <cmd> [args...]
+
+Fetches an AWS Secrets Manager secret (JSON object of env-var name → value)
+and execs the command with those variables exported.
+
+Required tools: aws, jq.
+USAGE
+  exit 2
+fi
+
+secret_id="$1"
+shift
+[[ "${1:-}" == "--" ]] && shift
+
+if [[ $# -lt 1 ]]; then
+  echo "aws-env-run: no command supplied after secret id" >&2
+  exit 2
+fi
+
+for bin in aws jq; do
+  command -v "$bin" >/dev/null || {
+    echo "aws-env-run: '$bin' not found in PATH" >&2
+    exit 127
+  }
+done
+
+# --- Identity -------------------------------------------------------------
+#
+# DEFAULTED, NOT INHERITED, matching bin/env-file-to-sm, bin/db-dsn-to-sm and
+# every Terraform provider block in this repo. An explicit override still wins.
+#
+# This one only READS, so the wrong account fails loudly with
+# ResourceNotFoundException rather than doing damage — but it is the script
+# that feeds TF_VAR_* values into every plan and apply. A wrong-account read
+# here would plan the platform against inputs from somewhere else, and the
+# values it carries (carrier CIDRs, livekit CIDRs) are exactly the kind that
+# produce a security group that is quietly wrong rather than obviously broken.
+#
+# Exported rather than passed as --profile because these variables also have
+# to reach the CHILD process: `aws-env-run ... -- terraform plan` relies on
+# Terraform inheriting the same identity the secret was read with. Passing
+# --profile here would authenticate this script and leave Terraform on the
+# default chain, which is the same class of bug one layer down.
+#
+# The profile deliberately carries no region (see ~/.aws/config), so AWS_REGION
+# has to be set too or every call fails with NoRegion.
+export AWS_PROFILE="${AWS_PROFILE:-klarity_aws}"
+export AWS_REGION="${AWS_REGION:-eu-central-1}"
+
+# SecretString lands on stdout; no temp file involved.
+secret_json=$(aws secretsmanager get-secret-value \
+  --secret-id "$secret_id" \
+  --query SecretString \
+  --output text)
+
+if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$secret_json"; then
+  echo "aws-env-run: secret '$secret_id' is not a JSON object" >&2
+  exit 1
+fi
+
+# Refuse keys that aren't valid POSIX env-var identifiers — otherwise anyone
+# who can write the secret could inject arbitrary shell into the eval below.
+# Keys are deliberately NOT @sh-escaped: they must stay bare identifiers in
+# `export NAME=...`, which is exactly why they have to be validated instead.
+bad_keys=$(jq -r '
+  to_entries[]
+  | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$") | not)
+  | .key
+' <<<"$secret_json")
+if [[ -n "$bad_keys" ]]; then
+  echo "aws-env-run: secret '$secret_id' contains keys that are not valid env-var names:" >&2
+  echo "$bad_keys" >&2
+  exit 1
+fi
+
+# @sh on the value produces a safely single-quoted shell literal, so values can
+# contain newlines, quotes, $, backticks, etc. without breaking the eval.
+eval "$(jq -r '
+  to_entries[]
+  | "export \(.key)=\(.value | tostring | @sh)"
+' <<<"$secret_json")"
+
+exec "$@"

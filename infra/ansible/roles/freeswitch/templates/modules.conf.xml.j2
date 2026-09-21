@@ -1,0 +1,18 @@
+<!-- {{ ansible_managed }}
+
+  What gets LOADED at start. Rendered from the same freeswitch_modules list as
+  modules.conf, so the set that is compiled and the set that is loaded cannot
+  drift apart.
+
+  This REPLACES the vanilla file, which loads a much broader set. Anything it
+  named that is not compiled here would log a load error on every start - noise
+  that trains people to ignore startup errors, which is the last habit you want
+  on a box carrying calls.
+-->
+<configuration name="modules.conf" description="Modules">
+  <modules>
+{% for module in freeswitch_modules %}
+    <load module="{{ module | basename }}"/>
+{% endfor %}
+  </modules>
+</configuration>

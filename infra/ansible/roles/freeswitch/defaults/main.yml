@@ -1,0 +1,99 @@
+---
+freeswitch_branch: v1.10
+freeswitch_prefix: /usr/local/freeswitch
+freeswitch_conf: "{{ freeswitch_prefix }}/etc/freeswitch"
+
+freeswitch_sip_port: 5060
+freeswitch_esl_inbound_port: 8021
+freeswitch_xmlrpc_port: 8085
+freeswitch_rtp_port_min: 16384
+freeswitch_rtp_port_max: 32768
+
+freeswitch_max_sessions: 2000
+freeswitch_sessions_per_second: 100
+freeswitch_rtp_timeout_sec: 300
+freeswitch_rtp_hold_timeout_sec: 1800
+
+freeswitch_recording_path: /mnt/recordings
+freeswitch_recording_format: wav
+recording_bucket: ""
+
+freeswitch_codecs:
+  - PCMU
+  - PCMA
+  - OPUS
+  - G722
+
+########################################################
+# THE module list. One list, three uses, so they cannot drift:
+#
+#   modules.conf      what gets COMPILED     (build time)
+#   modules.conf.xml  what gets LOADED       (start time)
+#   an assertion      what must exist after  (verified)
+#
+# WHY THIS FILE EXISTS AT ALL. Without a templated modules.conf the build uses
+# FreeSWITCH's source-tree default, which enables mod_verto - and mod_verto
+# needs SignalWire's libks, which is not in Debian. configure then dies with
+# "You need to either install libks2 or libks or disable mod_verto". That is
+# not a warning at minute 25; it is a hard stop at minute 1, and the only fix
+# is to control the list.
+#
+# MINIMAL ON PURPOSE. Every module here is either required for FreeSWITCH to
+# function or used by this platform. Anything absent is absent deliberately:
+# a module that is compiled and loaded is a thread set, a config file and an
+# attack surface for a feature nobody called.
+#
+# Notably NOT here:
+#   mod_verto, mod_signalwire   need libks (the reason for this file)
+#   mod_conference              this is a B2BUA that bridges; it does not host
+#                               conferences
+#   mod_xml_rpc                 no config templated for it, so it would be an
+#                               unmanaged control interface listening on a port
+#   mod_spandsp                 will not compile against spandsp3 - see below
+#   mod_lua, mod_syslog         nothing calls them; journald already has the
+#                               logs via mod_console under systemd
+########################################################
+freeswitch_modules:
+  # --- Core: FreeSWITCH is not usable without these ---
+  - applications/mod_commands        # the API set - `show channels`, `uuid_*`
+  - applications/mod_dptools         # dialplan applications: bridge, answer, set
+  - dialplans/mod_dialplan_xml
+  - endpoints/mod_sofia              # SIP itself
+  - loggers/mod_console
+  - loggers/mod_logfile
+  - timers/mod_timerfd               # Linux timer source; without it, poor timing
+
+  # --- THE control-plane integration ---
+  # mod_event_socket provides BOTH the inbound ESL listener and the `socket`
+  # dialplan application. Without it FreeSWITCH starts cleanly, answers calls,
+  # and can never reach the controller.
+  - event_handlers/mod_event_socket
+
+  # --- Media handling ---
+  - formats/mod_sndfile              # WAV: recordings and prompt playback
+  - formats/mod_native_file
+  - formats/mod_tone_stream          # ringback and tone generation
+  - formats/mod_local_stream         # music on hold
+  - codecs/mod_opus                  # the LiveKit leg; G.711 is in core
+
+  # mod_spandsp is DELIBERATELY ABSENT, and it is the one omission that is not
+  # about minimalism. FreeSWITCH 1.10.x targets the old spandsp v18 API and
+  # will not compile against the spandsp3 (git master) this role builds from
+  # source - so including it fails the build, late, after the long part.
+  #
+  # We do not need it: no fax, and DTMF on this platform is RFC2833 in-band on
+  # the SIP leg, which sofia handles. Re-add only alongside a pinned,
+  # API-compatible spandsp.
+
+  # --- Supporting ---
+  - applications/mod_expr
+  - applications/mod_hash
+  - applications/mod_db
+  - endpoints/mod_loopback           # required by transfers between contexts
+  - say/mod_say_en                   # several core applications depend on it
+  - xml_int/mod_xml_cdr              # CDRs, per the architecture
+
+# Probe the &socket() target at the end of the play. See the long note in
+# tasks/main.yml — set false for the first bootstrap run, when the controller
+# container does not exist yet.
+verify_esl_target: true

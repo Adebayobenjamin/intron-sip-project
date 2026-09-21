@@ -1,0 +1,41 @@
+# control-plane — the configuration and action API.
+#
+# THE ARCHITECTURE IS PINNED, and it is not a preference. The app tier runs
+# Debian on m6i.large, which is x86_64. A `docker build` on Apple silicon
+# defaults to arm64, pushes to ECR cleanly, pulls on the instance cleanly, and
+# then the container exits immediately with `exec format error` — which reads
+# as a broken image rather than a wrong-architecture one.
+
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+
+WORKDIR /src
+
+# Dependencies first, so a source-only change does not re-download them.
+COPY go.mod go.su[m] ./
+RUN go mod download
+
+COPY . .
+
+# CGO off and a static binary: the runtime image has no libc to link against.
+# -trimpath keeps build-host paths out of panics.
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+      -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION}" \
+      -o /out/control-plane ./cmd/control-plane
+
+# Distroless static: no shell, no package manager, nothing to exec into.
+# The trade is that debugging happens through logs and the health endpoint
+# rather than `docker exec`, which on a box reachable only over SSM was
+# already true.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /out/control-plane /usr/local/bin/control-plane
+
+# Documentation only — the unit runs with --network host, so these are not
+# published and not mapped. They are here so `docker inspect` says what the
+# process binds.
+EXPOSE 8080 8088
+
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/control-plane"]

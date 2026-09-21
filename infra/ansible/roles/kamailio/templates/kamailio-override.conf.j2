@@ -1,0 +1,37 @@
+{{ ansible_managed | comment }}
+# Drop-in, not a replacement unit — package upgrades keep working.
+
+[Unit]
+# StartLimit* BELONG IN [Unit], NOT [Service] — including in a drop-in.
+#
+# They were in [Service] below, where systemd ignores them, and this failure
+# demonstrated it rather than merely risking it: with Burst=5 the unit should
+# have given up after five attempts, and the journal instead read
+#
+#   kamailio.service: Scheduled restart job, restart counter is at 72.
+#
+# So the "give up rather than loop forever" intent in the comment below was not
+# in effect at all — the service flapped every 5s indefinitely on a config it
+# could never start with, which is exactly the noise the setting exists to
+# prevent. Moved in systemd 229; this box runs 252.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# NO SECRET HYDRATION. Kamailio reads no credentials, so there is no
+# ExecStartPre fetching from Secrets Manager and no AWS_REGION needed for one.
+# The edge instance role has had its secrets-read policy removed to match — if
+# a Kamailio secret is ever needed again, that IAM policy has to come back too,
+# and the failure without it is an AccessDenied inside ExecStartPre that stops
+# the unit from starting at all.
+
+# Kamailio holds a descriptor pair per TCP connection plus every UDP socket.
+# The systemd default is far below what the configured call volume needs.
+LimitNOFILE=65536
+
+# Restart on failure, but give up rather than loop forever on a bad config —
+# a service flapping is noisier and harder to see than one sitting in `failed`.
+# The giving-up half is StartLimitIntervalSec/StartLimitBurst in [Unit] above;
+# putting them here is accepted by the file and ignored by systemd.
+Restart=on-failure
+RestartSec=5

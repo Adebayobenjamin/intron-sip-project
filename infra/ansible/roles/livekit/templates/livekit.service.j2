@@ -1,0 +1,66 @@
+{{ ansible_managed | comment }}
+# intron-livekit - the LiveKit stack, run by systemd via compose.
+#
+# Type=exec with `compose up` in the FOREGROUND, not `up -d`. systemd owns the
+# process, sees the real exit status, and always runs ExecStop. Detached
+# compose would give systemd a wrapper that exits immediately and a unit that
+# reports active while every container is dead.
+
+[Unit]
+Description=Intron LiveKit server
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+# Give up after 5 failures in 10 minutes rather than looping forever. The
+# usual cause of a loop here is an unpopulated secret, and a unit sitting in
+# `failed` is visible where a crash-loop is just noise in the journal.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+Restart=on-failure
+RestartSec=10
+
+WorkingDirectory={{ livekit_config_root }}
+
+# AWS_REGION for the ExecStartPre hook below. The CLI has no other source for
+# it inside a systemd unit - no profile, no shell rc.
+Environment=AWS_REGION={{ aws_region }}
+
+# ---- Secrets -------------------------------------------------------------
+# Fetch from Secrets Manager and render livekit.yaml.tpl -> livekit.yaml.
+#
+# Runs at EVERY start, so a rotated API secret is picked up by `systemctl
+# restart` with no Ansible run. FAILS CLOSED: if the fetch fails or the secret
+# is missing a key, the unit does not start, rather than starting a server
+# whose only access control is the literal string ${LIVEKIT_API_SECRET}.
+#
+# That last point is the whole reason this is not a plain template task. This
+# server's security group is open to the internet; the signing key IS the
+# perimeter.
+ExecStartPre=/usr/local/bin/fetch-and-render-secrets.sh {{ livekit_secret_id }} {{ livekit_config_root }}
+
+# ---- Images --------------------------------------------------------------
+# Pull before up. Tags are pinned, so this is a no-op after the first pull and
+# costs nothing on a restart, while guaranteeing the images are present after
+# a version bump.
+ExecStartPre=/usr/bin/docker compose pull --quiet
+
+# ---- Run -----------------------------------------------------------------
+ExecStart=/usr/bin/docker compose up --abort-on-container-exit
+
+# ---- Stop ----------------------------------------------------------------
+# `compose down` rather than letting systemd kill the foreground process:
+# it stops the containers in dependency order and removes them, so a restart
+# is not greeted by name conflicts from the previous run.
+#
+# 60 seconds is generous for this service. Unlike the ESL controller, LiveKit
+# holds no per-call socket that has to be closed cleanly from our side - a
+# dropped WebSocket is something every client already handles by reconnecting.
+ExecStop=/usr/bin/docker compose down
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

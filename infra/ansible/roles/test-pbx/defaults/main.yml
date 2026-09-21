@@ -1,0 +1,62 @@
+---
+########################################################
+# Asterisk as a stand-in client SBC, for testing human handoff.
+#
+# Deliberately minimal. This box answers a call and rings one softphone; it is
+# not a contact centre and should not grow into one. If you find yourself
+# adding queues here, the thing you actually want is a real PBX.
+########################################################
+
+# Ubuntu, because Asterisk was dropped from Debian 12 and `apt install
+# asterisk` has no candidate there. Every other box in this repo is Debian.
+test_pbx_packages:
+  - asterisk
+
+########################################################
+# RTP range. MUST MATCH rtp_port_min/max in iac/stacks/test-pbx.
+#
+# The security group opens a range and Asterisk allocates within one. A
+# mismatch does not report itself - the call sets up cleanly, both sides think
+# they are connected, and there is no audio.
+########################################################
+test_pbx_rtp_port_min: 10000
+test_pbx_rtp_port_max: 20000
+
+test_pbx_sip_port: 5060
+
+# The extension Linphone registers as, and the user half of the handoff URI:
+#   sip:{{ test_pbx_agent_extension }}@{{ test_pbx_public_ip }}
+test_pbx_agent_extension: agent
+
+# How long the agent's phone rings before the call is considered unanswered.
+# Short on purpose: this is a test rig, and waiting 60s to find out a leg is
+# broken is a bad feedback loop.
+test_pbx_ring_seconds: 30
+
+########################################################
+# Codecs. ulaw/alaw only, matching what Twilio offers and what RTPEngine
+# relays without transcoding.
+#
+# NO OPUS. The AI leg uses it, but this is the handoff leg - a human on a
+# PSTN-quality path - and adding a codec the far end may not have only creates
+# a negotiation failure to debug.
+########################################################
+test_pbx_codecs:
+  - ulaw
+  - alaw
+
+########################################################
+# How often Asterisk sends OPTIONS to the registered softphone.
+#
+# Not primarily a health check - it is a NAT keepalive. The softphone sits
+# behind a domestic NAT whose mapping idles out in roughly 5-15 minutes, which
+# is shorter than the phone's re-REGISTER interval. Without traffic crossing it
+# the mapping dies while the registration is still on file, and the contact
+# goes on listing as present until a handoff arrives and fails.
+#
+# 30s is comfortably inside every common NAT timeout. It is also cheap here
+# because there is exactly one endpoint; the same interval across a real fleet
+# would be a lot of pointless OPTIONS.
+########################################################
+test_pbx_qualify_seconds: 30
+

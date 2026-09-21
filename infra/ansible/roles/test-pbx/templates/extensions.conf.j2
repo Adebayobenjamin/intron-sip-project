@@ -1,0 +1,45 @@
+{{ ansible_managed | comment }}
+;
+; Dialplan for the test PBX. Two contexts, one useful path.
+
+[general]
+static=yes
+writeprotect=yes
+
+;=======================================================
+; Calls arriving FROM the Intron edge — the handoff leg.
+;
+; Whatever was dialled, ring the agent. The dialled number is not inspected on
+; purpose: the handoff target is chosen by the control plane, and this box's
+; job is to answer, not to route. Matching on a specific extension here would
+; mean two places that have to agree about the URI.
+;=======================================================
+[from-intron]
+exten => _.,1,NoOp(HANDOFF from ${CALLERID(num)} to ${EXTEN})
+ ; Logged loudly because this line is the whole point of the rig: seeing it
+ ; means FreeSWITCH bridged out, Kamailio's route[EGRESS] relayed, and the
+ ; INVITE crossed the internet to get here.
+ same => n,Verbose(1, HANDOFF RECEIVED: caller=${CALLERID(num)} dialled=${EXTEN} from=${CHANNEL(pjsip,remote_addr)})
+ same => n,Answer()
+ ; A beat before ringing. Without it the early-media path and the answer can
+ ; race, and what you hear is a clipped first second that looks like a codec
+ ; problem.
+ same => n,Wait(1)
+ same => n,Dial(PJSIP/{{ test_pbx_agent_extension }},{{ test_pbx_ring_seconds }})
+ ; DIALSTATUS is the diagnostic. NOANSWER means the leg worked and nobody
+ ; picked up; CHANUNAVAIL means Linphone is not registered, which is the
+ ; common case and looks identical from the caller's end.
+ same => n,NoOp(dial ended: ${DIALSTATUS})
+ same => n,Hangup()
+
+;=======================================================
+; Calls FROM the agent.
+;
+; Rejected. This rig exists to RECEIVE a handoff; letting a registered
+; extension originate would make it capable of placing calls, and an
+; internet-facing box that can place calls is a toll-fraud target whether or
+; not anybody meant it to be.
+;=======================================================
+[from-agent]
+exten => _.,1,NoOp(outbound from agent rejected - this rig only receives)
+ same => n,Hangup(CALL_REJECTED)

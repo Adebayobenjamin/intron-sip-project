@@ -1,0 +1,98 @@
+---
+########################################################
+# FreeSWITCH — built from source.
+#
+# From source rather than from packages because SignalWire moved their Debian
+# repository behind an access token. The build is slow (~20 minutes on
+# c6i.xlarge, and the reason ansible_aws_ssm_timeout is an hour) but it has no
+# credential to distribute or renew.
+########################################################
+freeswitch_branch: v1.10
+freeswitch_prefix: /usr/local/freeswitch
+
+freeswitch_sip_port: 5060
+
+# Codecs in preference order. PCMU/PCMA first deliberately: the carrier leg is
+# almost always G.711 and transcoding costs CPU on the box that can least
+# afford it. OPUS is there for the LiveKit leg, where it is worth the cost.
+freeswitch_codecs:
+  - PCMU
+  - PCMA
+  - OPUS
+  - G722
+
+########################################################
+# Recordings — written locally, shipped to S3, deleted.
+#
+# /mnt/recordings is a SEPARATE EBS VOLUME, not a directory on root. The thing
+# most likely to fill a disk here is recordings, and a full root volume takes
+# FreeSWITCH down along with the SSM agent — turning a disk-space problem into
+# a box nobody can log into to fix it.
+########################################################
+freeswitch_recording_path: /mnt/recordings
+freeswitch_recording_format: wav
+
+# Empty until the call-recordings bucket exists. The role skips the uploader
+# entirely rather than installing something that fails every minute.
+recording_bucket: ""
+recording_region: "{{ aws_region }}"
+
+########################################################
+# Core concurrency limits.
+#
+# Set EXPLICITLY rather than inherited from the vanilla config, because vanilla
+# is max-sessions 1000 / sessions-per-second 30 and nobody chooses those — they
+# are simply what is there when no one looks. 30 calls per second is low enough
+# to refuse setup during an ordinary burst, and the refusal looks like a
+# carrier problem.
+#
+# A BRIDGED CALL IS TWO SESSIONS. 2000 sessions is ~1000 concurrent calls on
+# this node, which on 4 vCPU / 8 GiB is generous.
+#
+# The real ceiling is not memory or CPU — it is the RTP port range.
+# 16384-32768 is 16,384 ports at two per session, so ~8,000 sessions however
+# much else is spare. 2000 stays well inside that and leaves the ephemeral
+# range above 32768 alone.
+########################################################
+freeswitch_max_sessions: 2000
+freeswitch_sessions_per_second: 100
+
+# Reap channels whose media has stopped. This one is about correctness rather
+# than capacity: with no timeout, a channel whose RTP dries up — the far end
+# vanished, the carrier dropped it without a BYE — is held forever, counting
+# against max-sessions and against the port range.
+freeswitch_rtp_timeout_sec: 300
+freeswitch_rtp_hold_timeout_sec: 1800
+
+# Every FreeSWITCH node is private-only. No public interface, no Elastic IP,
+# and nothing reaches it except through the edge.
+#
+# Consequence for the config: vanilla vars.xml resolves external_rtp_ip and
+# external_sip_ip via STUN against stun.freeswitch.org, and X-PRE-PROCESS runs
+# that lookup at config parse whether or not any profile uses the result. That
+# is a third-party dependency in the startup path of a box with no public
+# networking. The role pins both to ansible_host instead.
+network_private_only: true
+
+tune_network_buffers: true
+
+########################################################
+# SIP diagnostics, on this tier only.
+#
+# sngrep reads the same packets tcpdump does but understands SIP: it groups
+# them into CALLS, so you get a ladder diagram of one dialog rather than a flat
+# packet list. The questions that actually come up here are dialog-shaped —
+# which leg sent the BYE, what the far end answered with, what address ended up
+# in the SDP — and reassembling those from raw tcpdump output, over an SSM
+# session, during an incident, is the wrong time to be doing it.
+#
+# BOTH SIP TIERS, not just the edge. A call crosses carrier -> Kamailio ->
+# FreeSWITCH and back out; having the tool at one end of a two-ended problem
+# means apt-installing on the other end mid-incident. The app tier is
+# deliberately excluded — it speaks ESL and HTTP, never SIP.
+#
+#   sngrep -d any port 5060        live
+#   sngrep -I capture.pcap         read back a tcpdump file
+########################################################
+common_extra_packages:
+  - sngrep

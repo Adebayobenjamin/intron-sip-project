@@ -1,0 +1,22 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+########################################################
+# Restart, one service at a time, through the unit — so ExecStop runs and the
+# ESL controller drains rather than dropping its calls.
+#
+# The play sets `serial: 1`, which is what makes this safe: the peer node is
+# still registered and accepting while this one drains. Without it, every node
+# would drain simultaneously and the deploy would drop exactly the calls the
+# drain exists to protect.
+########################################################
+- name: restart app services
+  ansible.builtin.systemd:
+    name: "intron-{{ item.name }}"
+    state: restarted
+    daemon_reload: true
+  loop: "{{ app_services }}"
+  loop_control:
+    label: "{{ item.name }}"

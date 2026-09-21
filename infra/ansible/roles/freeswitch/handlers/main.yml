@@ -1,0 +1,32 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+########################################################
+# A FreeSWITCH restart DROPS EVERY CALL ON THIS NODE. There is no drain.
+#
+# playbooks/freeswitch.yml sets serial: 1, so a farm-wide restart takes nodes
+# one at a time and Kamailio's dispatcher routes around the one that is down —
+# provided there is more than one node. With the single node beta runs, this
+# handler drops every call on the platform.
+########################################################
+- name: restart freeswitch
+  ansible.builtin.systemd:
+    name: freeswitch
+    state: restarted
+    daemon_reload: true
+
+########################################################
+# reloadxml re-reads the dialplan WITHOUT touching calls in progress.
+#
+# Which is why dialplan changes notify this and profile or event-socket changes
+# notify the restart above. It is worth knowing the boundary: reloadxml picks up
+# dialplan and directory changes; it does NOT pick up sip_profiles or
+# autoload_configs, which need the profile restarted or the switch restarted.
+# A change to those that only triggers a reload appears to apply and does not.
+########################################################
+- name: reload freeswitch xml
+  ansible.builtin.command:
+    cmd: "{{ freeswitch_prefix }}/bin/fs_cli -x reloadxml"
+  changed_when: true

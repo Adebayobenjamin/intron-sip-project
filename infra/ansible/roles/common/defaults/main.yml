@@ -1,0 +1,50 @@
+---
+# Whether this host gets the VoIP network-buffer tuning.
+#
+# False by default and switched on per group (edge, freeswitch). The app tier
+# handles no media and absorbs no UDP bursts — raising its socket buffers would
+# be cargo-culting a setting from a tier with a different problem.
+tune_network_buffers: false
+
+network_rmem_max: 16777216
+network_rmem_default: 16777216
+network_wmem_max: 16777216
+network_wmem_default: 8388608
+network_netdev_max_backlog: 5000
+
+# Single-NIC hosts with no public address. Used by roles downstream to decide
+# whether a daemon should advertise a public address at all.
+network_private_only: false
+
+common_base_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - jq
+  - unzip
+  # envsubst, used by fetch-and-render-secrets.sh to substitute Secrets Manager
+  # values into config templates at service start.
+  - gettext-base
+  # Diagnostics. tcpdump in particular is not optional on a SIP box — when
+  # signalling and media disagree, the capture is the only source of truth, and
+  # installing it mid-incident over an SSM session is a bad time to find out
+  # the mirrors are unreachable.
+  - tcpdump
+  # sngrep is NOT here — it is in common_extra_packages, set per group, so it
+  # lands on the SIP tiers only. See below.
+  - net-tools
+  - dnsutils
+  - htop
+  - vim
+
+########################################################
+# Per-group additions to the base list above.
+#
+# Empty by default so a tier only carries what it has a use for. Set it in
+# inventories/<env>/group_vars/<group>.yml.
+#
+# This exists because sngrep belongs on the SIP tiers and nowhere else: the app
+# tier speaks ESL and HTTP, never SIP, so a SIP-dialog viewer there is noise.
+# The base list is for things every box needs.
+########################################################
+common_extra_packages: []

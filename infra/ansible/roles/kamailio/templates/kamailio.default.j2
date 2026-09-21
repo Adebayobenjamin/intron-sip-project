@@ -1,0 +1,10 @@
+{{ ansible_managed | comment }}
+RUN_KAMAILIO=yes
+USER=kamailio
+GROUP=kamailio
+CFGFILE={{ kamailio_config_dir }}/kamailio.cfg
+
+# One file descriptor pair per TCP connection plus every UDP socket. The
+# default 1024 caps the box well below its intended call volume, and the
+# failure is call setup starting to fail at a number nobody chose.
+DUMP_CORE=no

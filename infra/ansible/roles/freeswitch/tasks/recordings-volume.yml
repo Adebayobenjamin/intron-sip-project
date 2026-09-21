@@ -1,0 +1,116 @@
+---
+########################################################
+# Mount the recordings EBS volume.
+#
+# FIND IT BY VOLUME ID, NEVER BY DEVICE PATH.
+#
+# Terraform attaches it as /dev/sdf because the API demands a device name, and
+# a Nitro instance ignores that entirely: EBS volumes appear as /dev/nvme[N]n1
+# in attachment order, and which number this one gets is not stable across a
+# stop/start.
+#
+# The danger is concrete, not theoretical. On this instance:
+#
+#     nvme0n1  vol026180e7231435ca9   <- ROOT
+#     nvme1n1  vol04d3f614923300c93   <- recordings
+#
+# Both are NVMe, both serials start with "vol". A role that formats "the first
+# unmounted nvme device", or trusts /dev/sdf, eventually formats the root
+# volume. Matching the exact volume ID is the only safe identifier.
+#
+# The NVMe serial IS the EBS volume ID with the dash stripped, and `lsblk`
+# exposes it without nvme-cli or any other package - it comes from util-linux,
+# which is always present.
+########################################################
+
+- name: Assert the recordings volume ID is known
+  ansible.builtin.assert:
+    that:
+      - recordings_volume_id is defined
+      - recordings_volume_id is match('^vol-')
+    fail_msg: >-
+      recordings_volume_id is unset or malformed for {{ inventory_hostname }}.
+      It is required - without it this role has no safe way to tell the
+      recordings volume from the root volume, and guessing risks formatting
+      the wrong one. Get it from: cd infra/iac && make output STACK=sip-core
+      ENV={{ env_name }} EXTRA="-raw ansible_inventory_hint"
+
+########################################################
+# ONE lookup, no retry pass.
+#
+# This used to be two tasks: try, install nvme-cli if that failed, try again.
+# Both registered to the same variable, and that is a trap - a SKIPPED task
+# still overwrites the variable it registers to, with a result dict that has
+# no `rc`. So on the first run (nvme-cli absent, retry actually runs) it
+# worked, and on every run after (nvme-cli present, retry skipped) the next
+# `when: recordings_device.rc != 0` failed with "object of type 'dict' has no
+# attribute 'rc'".
+#
+# Using lsblk removes the package, the retry, and the trap in one go.
+########################################################
+- name: Locate the recordings volume by its NVMe serial
+  ansible.builtin.shell: |
+    set -euo pipefail
+    lsblk -dno NAME,SERIAL | awk -v want="{{ recordings_volume_id | replace('-', '') }}" \
+      '$2 == want { print "/dev/" $1; found=1 } END { exit found ? 0 : 1 }'
+  args:
+    executable: /bin/bash
+  register: recordings_device
+  changed_when: false
+  failed_when: false
+
+# Gathered only on failure, so the error can say what IS attached rather than
+# just what is missing. Registered to its own variable - see the note above
+# about skipped tasks clobbering a shared one.
+- name: Collect attached devices for the failure message
+  ansible.builtin.command:
+    cmd: lsblk -dno NAME,SERIAL,SIZE
+  register: recordings_lsblk
+  changed_when: false
+  when: recordings_device.rc != 0
+
+- name: Fail if the recordings volume is not attached
+  ansible.builtin.fail:
+    msg: >-
+      No block device on {{ inventory_hostname }} has a serial matching
+      {{ recordings_volume_id }}. Either the volume is not attached, or the ID
+      in the inventory is stale - refresh it with
+      `make output STACK=sip-core ENV={{ env_name }} EXTRA="-raw ansible_inventory_hint"`.
+      Deliberately NOT falling back to a device path: guessing risks formatting
+      the root volume, which is also NVMe with a "vol" serial.
+      Attached devices (name / serial / size):
+      {{ recordings_lsblk.stdout_lines | default(['(could not read)']) | join(' | ') }}
+  when: recordings_device.rc != 0
+
+- name: Create the filesystem
+  # force: false is the guard that makes this both idempotent AND safe - the
+  # module refuses to reformat a device that already carries a filesystem, so
+  # re-running the play on a node with existing recordings cannot destroy them.
+  community.general.filesystem:
+    fstype: ext4
+    dev: "{{ recordings_device.stdout | trim }}"
+    force: false
+
+- name: Read the filesystem UUID
+  ansible.builtin.command:
+    cmd: "blkid -s UUID -o value {{ recordings_device.stdout | trim }}"
+  register: recordings_uuid
+  changed_when: false
+
+- name: Mount the recordings volume
+  ansible.posix.mount:
+    path: "{{ freeswitch_recording_path }}"
+    # BY UUID in fstab, not by the NVMe path. The path can change across a
+    # stop/start, and a stale fstab entry means the box fails to reach
+    # multi-user - which on a machine whose only access is the SSM agent is a
+    # rebuild rather than a fix.
+    src: "UUID={{ recordings_uuid.stdout | trim }}"
+    fstype: ext4
+    # nofail so a missing volume degrades to "recordings do not work" instead
+    # of "the instance will not finish booting and cannot be reached".
+    opts: defaults,noatime,nofail
+    state: mounted
+
+# Ownership is deliberately NOT set here - the freeswitch user does not exist
+# yet at this point in the role. main.yml chowns this path once the user has
+# been created, along with the rest of the runtime directories.

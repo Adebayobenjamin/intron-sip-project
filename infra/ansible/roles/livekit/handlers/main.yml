@@ -1,0 +1,19 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+########################################################
+# Restart through the unit, so ExecStop runs `compose down` and the containers
+# stop in dependency order.
+#
+# THIS DROPS EVERY CALL IN PROGRESS, and there is no drain because there is
+# nowhere to drain to - one node, and LiveKit rooms are node-local without a
+# shared Redis. A config change here is a short outage, deliberately, rather
+# than a rolling one that does not exist.
+########################################################
+- name: restart livekit
+  ansible.builtin.systemd:
+    name: intron-livekit
+    state: restarted
+    daemon_reload: true

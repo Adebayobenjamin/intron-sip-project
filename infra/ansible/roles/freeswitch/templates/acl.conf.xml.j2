@@ -1,0 +1,61 @@
+{{ ansible_managed | comment('xml') }}
+<!--
+  Network lists referenced by apply-inbound-acl params elsewhere in the config.
+
+  THE "esl" LIST IS LOAD-BEARING. mod_event_socket does not run without an ACL:
+  if no apply-inbound-acl is configured it installs one itself. From
+  src/mod/event_handlers/mod_event_socket/mod_event_socket.c:
+
+      if (!prefs.acl_count) {
+          prefs.acl[prefs.acl_count++] = strdup("loopback.auto");
+      }
+
+  So "no ACL param" does not mean "no ACL" - it means loopback-only, which
+  rejects the ESL controller on the app subnet. The failure is nasty to read:
+  the TCP handshake SUCCEEDS, then the switch replies text/rude-rejection
+  ("Access Denied, go away.") and hangs up, so it presents as a network or
+  firewall problem rather than a config one, and nothing is logged at the
+  default log level.
+
+  Defence in depth, not the only defence. The security group is the outer
+  layer; this is the inner one, and it exists because the two are edited by
+  different people at different times. ESL is full remote control of the switch
+  - originate, uuid_kill, eval - so an accidentally-widened port should still
+  find a closed door.
+-->
+<configuration name="acl.conf" description="Network Lists">
+  <network-lists>
+    <!--
+      default="deny": anything not listed is refused. The FreeSWITCH default
+      for an unlisted node is to fall through to the list default, so this
+      being "deny" is what makes the entries below meaningful.
+    -->
+    <list name="esl" default="deny">
+      <!--
+        The ESL controller. Both app subnets, because the control-plane
+        instance can be rebuilt into either AZ and its address is not pinned.
+        Mirrors app_subnet_cidrs in inventories/{{ env_name }}/group_vars/all.yml,
+        which mirrors iac/stacks/network.
+      -->
+{% for cidr in app_subnet_cidrs %}
+      <node type="allow" cidr="{{ cidr }}"/>
+{% endfor %}
+
+      <!--
+        This node itself. fs_cli connects to listen-ip ({{ ansible_host }}),
+        not to loopback, so its source address is this box's private IP and
+        loopback entries do not cover it. Without this line every fs_cli
+        invocation on the box fails, including the role's own `reloadxml`
+        handler and the unit's ExecReload.
+      -->
+      <node type="allow" cidr="{{ ansible_host }}/32"/>
+
+      <!--
+        Loopback, for completeness rather than need - nothing listens there
+        while listen-ip is the private address. Kept so that narrowing
+        listen-ip to 127.0.0.1 later does not silently lock the box out.
+      -->
+      <node type="allow" cidr="127.0.0.1/32"/>
+    </list>
+  </network-lists>
+</configuration>

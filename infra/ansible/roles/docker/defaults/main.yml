@@ -1,0 +1,13 @@
+---
+docker_apt_repo: "https://download.docker.com/linux/debian"
+
+# journald, not docker's default json-file. json-file writes to the root
+# volume with no rotation configured by default; a chatty service fills the
+# disk, and a full root volume takes the SSM agent down with it — turning a log
+# problem into a box nobody can get into. journald is size-capped by systemd
+# and is what the CloudWatch agent already ships.
+docker_log_driver: journald
+
+# Reclaim space from images the immutable-tag deploy model leaves behind: every
+# deploy pulls a new tag and the old layers stay until something prunes them.
+docker_prune_schedule: "weekly"

@@ -1,0 +1,533 @@
+#!KAMAILIO
+{{ ansible_managed | comment }}
+#
+# Kamailio for the Intron SIP edge.
+#
+# Role: SIP hub. It accepts INVITEs from allowed carrier ranges, dispatches
+# them to the FreeSWITCH farm, and relays what the farm sends back out.
+#
+# What it deliberately does NOT do:
+#   anchor media              RTPEngine does, on this same box
+#   decide admission          the controller does, in-process against Postgres,
+#                             with the call already in hand
+#   hold carrier config       trunks are application-layer; an egress INVITE
+#                             arrives with the destination already in its
+#                             Request-URI
+#   sit in the control path   originate is controller -> FreeSWITCH over ESL
+#
+# The last three were all true in the other direction until recently. If a
+# comment anywhere below still implies Kamailio asks the control plane
+# anything, it is stale — see docs/API.md.
+
+####### Defined Values #########
+
+#!define FLT_NATS 5
+#!define FLB_NATB 6
+#!define FLB_NATSIPPING 7
+
+#!define DS_FREESWITCH {{ kamailio_dispatcher_set_freeswitch }}
+#!define DS_LIVEKIT {{ kamailio_dispatcher_set_livekit }}
+
+# NO import_file "secrets.cfg". Kamailio holds no credentials at all now:
+# CONTROL_PLANE_API_TOKEN went when admission moved to the controller, and
+# FREESWITCH_ESL_PASSWORD went when originate became controller -> FreeSWITCH
+# over ESL. With nothing to substitute, the whole hydration path — the
+# template, this import, the ExecStartPre hook and the Secrets Manager
+# container itself — has been removed rather than left rendering an empty file.
+
+####### Global Parameters #########
+
+debug=2
+log_stderror=no
+log_facility=LOG_LOCAL0
+
+children={{ kamailio_children }}
+
+# ---------------------------------------------------------------------------
+# LISTEN AND ADVERTISE — the AWS-specific part, and the one that breaks calls.
+#
+# The instance has ONE NIC holding {{ ansible_host }}. The Elastic IP
+# {{ kamailio_public_ip }} is mapped 1:1 at the VPC edge and appears NOWHERE on
+# the box — not on an interface, not in metadata that Kamailio reads.
+#
+# So Kamailio binds the private address and ADVERTISES the public one. Without
+# `advertise`, the Via and Contact headers it emits carry {{ ansible_host }},
+# and the carrier's ACK and BYE are sent to an address it cannot route to. The
+# INVITE succeeds, the call answers, and then nothing can tear it down —
+# channels leak until something times out.
+#
+# The value comes from Terraform (edge_public_ips) through the inventory, and
+# playbooks/edge.yml asserts it is set before this template is rendered.
+#
+# THIS IS THE DEFAULT, NOT THE RULE FOR EVERY CALL. `advertise` here applies to
+# every message on the socket, and that is wrong for the one dialog that never
+# leaves the VPC — FreeSWITCH <-> here <-> livekit-sip. route[EGRESS] and
+# route[WITHINDLG] override it per message with set_advertised_address(); see
+# the long note on the LiveKit branch in route[EGRESS] for what the public
+# address broke there.
+# ---------------------------------------------------------------------------
+listen=udp:{{ ansible_host }}:{{ sip_port }} advertise {{ kamailio_public_ip }}:{{ sip_port }}
+listen=tcp:{{ ansible_host }}:{{ sip_port }} advertise {{ kamailio_public_ip }}:{{ sip_port }}
+
+# NO CONTROL LISTENER. There used to be a tcp listener on 8080 here for the
+# control plane to drive outbound originate over xhttp. The port is written
+# out rather than templated because the variable behind it
+# (kamailio_xhttp_port) has been deleted too — referencing it here to explain
+# its own removal is how this template failed to render once already.
+#
+# Originate now goes controller -> FreeSWITCH directly
+# over ESL :{{ freeswitch_esl_inbound_port }}, so Kamailio is not in the
+# control path at all — only the signalling path. See docs/API.md, Contract 3.
+#
+# Deleted rather than left listening: a port open for a path nothing uses is
+# something the next person wires to.
+
+# Kamailio must not resolve its own advertised address via DNS.
+auto_aliases=no
+alias="{{ kamailio_public_ip }}"
+
+####### Modules #########
+
+loadmodule "jsonrpcs.so"
+loadmodule "kex.so"
+loadmodule "corex.so"
+loadmodule "tm.so"
+loadmodule "tmx.so"
+loadmodule "sl.so"
+loadmodule "rr.so"
+loadmodule "pv.so"
+loadmodule "maxfwd.so"
+loadmodule "textops.so"
+loadmodule "siputils.so"
+loadmodule "xlog.so"
+loadmodule "sanity.so"
+loadmodule "ctl.so"
+loadmodule "dispatcher.so"
+loadmodule "rtpengine.so"
+loadmodule "nathelper.so"
+
+# http_client, jansson and xhttp are all GONE, and none of them is coming back
+# by accident — nothing in this file references them any more.
+#
+#   http_client + jansson   the per-INVITE admission lookup against the control
+#                           plane. Admission is now an in-process package in the
+#                           controller, against Postgres, with the call already
+#                           in hand (docs/API.md, Contract 1).
+#   xhttp                   the /originate control interface. Originate is ESL
+#                           now (Contract 3).
+#
+# Their removal takes two silent-failure modes with it: the `admitted`
+# boolean-versus-string mismatch in jansson_get, and the missing Authorization
+# header on the http_client call. Both are now impossible rather than handled.
+
+# ----- rtpengine -----
+# Loopback, because RTPEngine runs on this same instance. There is deliberately
+# no security group rule for the ng port; splitting the daemons onto separate
+# hosts means changing this AND adding that rule, and forgetting the rule means
+# every call sets up with no media.
+modparam("rtpengine", "rtpengine_sock", "udp:{{ rtpengine_listen_ng }}")
+modparam("rtpengine", "rtpengine_tout_ms", 1000)
+
+# ----- dispatcher -----
+modparam("dispatcher", "list_file", "{{ kamailio_config_dir }}/dispatcher.list")
+# Active probing. A FreeSWITCH node that stops answering OPTIONS is taken out
+# of rotation; without this, Kamailio keeps dispatching to a dead node and
+# every call routed there fails.
+modparam("dispatcher", "ds_ping_interval", {{ kamailio_dispatcher_ping_interval }})
+modparam("dispatcher", "ds_probing_mode", 1)
+modparam("dispatcher", "ds_ping_from", "sip:probe@{{ kamailio_public_ip }}")
+modparam("dispatcher", "flags", 2)
+
+####### Routing Logic #########
+
+request_route {
+    if (!mf_process_maxfwd_header("10")) {
+        sl_send_reply("483", "Too Many Hops");
+        exit;
+    }
+
+    if (!sanity_check("1511", "7")) {
+        xlog("L_WARN", "malformed request from $si:$sp\n");
+        exit;
+    }
+
+    # In-dialog requests follow the Record-Route set on the initial INVITE.
+    # They carry no routing decision of their own — the destination was chosen
+    # once, at setup, and loose_route() follows it.
+    if (has_totag()) {
+        route(WITHINDLG);
+        exit;
+    }
+
+    if (is_method("CANCEL")) {
+        if (t_check_trans()) {
+            route(RELAY);
+        }
+        exit;
+    }
+
+    t_check_trans();
+
+    # RECORD-ROUTE IS NOT HERE ANY MORE, AND THE MOVE IS THE WHOLE POINT.
+    #
+    # It used to run at this line, above the branch below. record_route()
+    # builds its URI from whatever address the message is set to advertise AT
+    # THE MOMENT IT IS CALLED, and at this point that is still the global
+    # `advertise` on the listen socket — the public Elastic IP, for every call.
+    #
+    # That is right for a carrier dialog and wrong for the LiveKit one, which
+    # never leaves the VPC. So the call now lives in route[DISPATCH] and
+    # route[EGRESS], below the branch, where each knows which of the two it is
+    # building a route set for. See the long note in route[EGRESS].
+    #
+    # It still has to happen on every initial INVITE. Without it the two ends
+    # exchange BYEs directly, Kamailio never sees the call end, rtpengine_delete()
+    # never fires, and the media port range leaks until a restart.
+    #
+    # Nothing else needs it: OPTIONS and the 405 fall-through below establish no
+    # dialog, so both branches together still cover every request that creates one.
+
+    # ---------------------------------------------------------------------
+    # BRANCH ON SOURCE, and this branch is load-bearing.
+    #
+    # Two kinds of INVITE arrive here and they are not interchangeable:
+    #
+    #   from a carrier ({{ carrier_sip_cidrs | default([]) | length }} allowed
+    #                   range(s) on the security group)
+    #                   inbound. Dispatch to the FreeSWITCH farm. Admission is
+    #                   NOT decided here — the controller does it in-process
+    #                   once it has the call.
+    #
+    #   from the farm  ({{ sip_subnet_cidr }})
+    #                   egress. The LiveKit B-leg, a human handoff, or an
+    #                   outbound originate. The Request-URI is a carrier number
+    #                   or a LiveKit endpoint, NOT a tenant DID.
+    #
+    # Sending an egress INVITE down the inbound path is the failure this guards
+    # against: the dispatcher would send FreeSWITCH's own outbound call back to
+    # FreeSWITCH. The call answers and then dies at bridge — late, and pointing
+    # at the wrong layer entirely.
+    # ---------------------------------------------------------------------
+    if (is_method("INVITE")) {
+        if (src_ip == {{ sip_subnet_cidr }}) {
+            route(EGRESS);
+        } else {
+            route(DISPATCH);
+        }
+        exit;
+    }
+
+    if (is_method("OPTIONS")) {
+        sl_send_reply("200", "OK");
+        exit;
+    }
+
+    sl_send_reply("405", "Method Not Allowed");
+    exit;
+}
+
+# ---------------------------------------------------------------------------
+# EGRESS — INVITEs the FreeSWITCH farm sends OUT through this proxy.
+#
+# Three call types, one route: the LiveKit B-leg, a human handoff, and an
+# outbound originate. They are told apart by the X-Intron-Egress header that
+# FreeSWITCH sets from the dial string, NOT by the shape of the Request-URI —
+# a handoff target that is a bare E.164 is indistinguishable from a carrier
+# destination, and guessing works right up until it does not.
+#
+# KAMAILIO HOLDS NO CARRIER CONFIG. For a carrier egress the Request-URI
+# already names the trunk host, put there by the application from the
+# from-DID's `dids` row, and sip_route_uri forced the packet here as the next
+# hop. So there is no sofia gateway, no dispatcher set and no carrier hostname
+# anywhere in this file — consistent with trunking being application-layer.
+#
+# LiveKit is the exception ON PURPOSE. It is one platform-level destination, so
+# it stays on dispatcher set {{ kamailio_dispatcher_set_livekit }} where it is
+# probed with OPTIONS — and that AP/IP probe state is the diagnostic
+# docs/LIVEKIT.md tells you to read when the AI leg fails. A hostname in a dial
+# string has no probe state to read.
+#
+# This route REPLACES route[ADMISSION], which asked the control plane over HTTP
+# on every inbound INVITE. See docs/API.md, Contract 1 — the short version is
+# that Kamailio is process-per-message, so a blocked worker handles nothing
+# else, and a single-AZ RDS blip became a total inbound outage.
+# ---------------------------------------------------------------------------
+route[EGRESS] {
+    # NOT OPTIONAL. Without it the SDP carries a FreeSWITCH private address
+    # straight out to the carrier or to LiveKit. Signalling is clean end to
+    # end, the call answers, and there is no audio in one direction — the same
+    # failure the advertised-address note warns about, reached from the other
+    # side. Record-Route is now done per branch at the bottom of this route
+    # rather than once in request_route; if an egress INVITE ever reaches RELAY
+    # without passing one of those two calls, the BYE goes end to end,
+    # rtpengine_delete() never fires, and the media port range leaks until a
+    # restart.
+    route(MEDIA_OFFER);
+
+    if ($hdr(X-Intron-Egress) == "livekit") {
+        # UNQUOTED ARGS — see the note on ds_select_dst in route[DISPATCH].
+        if (!ds_select_dst(DS_LIVEKIT, 4)) {
+            xlog("L_ERR", "no LiveKit destination available: set {{ kamailio_dispatcher_set_livekit }} is empty or all destinations are down. livekit_sip_host set?\n");
+            sl_send_reply("503", "No LiveKit Destination");
+            exit;
+        }
+
+        # -----------------------------------------------------------------
+        # ADVERTISE THE PRIVATE ADDRESS ON THIS LEG. THESE TWO LINES ARE WHAT
+        # LET THE AI AGENT HANG UP AND TRANSFER.
+        #
+        # This dialog is FreeSWITCH <-> here <-> livekit-sip. BOTH ends are
+        # inside the VPC ({{ ansible_host }} and {{ livekit_sip_host | default('the livekit host') }}), so
+        # there is no reason for anything in it to name the Elastic IP — and
+        # every reason not to.
+        #
+        # WHAT THE PUBLIC ADDRESS DID HERE. The global `advertise` on the
+        # listen socket put {{ kamailio_public_ip }} in the Via and the
+        # Record-Route of the INVITE to livekit-sip. Its route set therefore
+        # pointed at an address that leaves the VPC: every in-dialog request
+        # it sent went out through the internet gateway and came back sourced
+        # from its own Elastic IP instead of its private address — which is
+        # NOT what the edge security group admits (the LiveKit rules are
+        # written against livekit_cidrs, and the FreeSWITCH rule is a security
+        # GROUP REFERENCE, which only ever matches a private source). So the
+        # packets were dropped at the boundary.
+        #
+        # The symptom was specific and misleading: calls set up fine and had
+        # audio, because the INVITE travels the other way and RTP is admitted
+        # from anywhere. Only the teardown failed. The agent would decide to
+        # end the call, livekit-sip would send a BYE, nothing would happen, and
+        # FreeSWITCH would eventually send its own BYE and get back
+        # `481 Call/Transaction Does Not Exist`. That reads as dialog-state
+        # corruption somewhere in the stack rather than as a firewall dropping
+        # one direction.
+        #
+        # SIP REFER TRAVELS THIS EXACT PATH, which is why agent-initiated
+        # handoff could not have worked before this line existed. It is a
+        # prerequisite, not an improvement.
+        #
+        # IT TAKES BOTH CALLS, AND THIS IS THE PART THAT IS EASY TO GET WRONG.
+        # They are not belt and braces; they fix two different headers, and
+        # each alone leaves a call that still fails:
+        #
+        #   set_advertised_address()          the Via. Decides where the far
+        #                                     end sends RESPONSES.
+        #   record_route_advertised_address() the Record-Route. Decides where
+        #                                     it sends in-dialog REQUESTS.
+        #
+        # THE ADVERTISED ADDRESS DOES NOT REACH THE RECORD-ROUTE ON ITS OWN.
+        # That is the natural assumption and it is wrong — kamailio/kamailio
+        # issue #1174: the Via is rewritten, the Record-Route keeps the host's
+        # own address. record_route_advertised_address() exists precisely
+        # because of that gap, which is why the explicit form is used here
+        # instead of the plain record_route() the other branch uses.
+        #
+        # Relying on set_advertised_address() alone would have given a call
+        # whose responses came back fine and whose BYE still vanished — the
+        # same visible symptom as no fix at all, after a change that looks
+        # like it addressed it.
+        #
+        # This one takes address:port, unlike the call above.
+        # -----------------------------------------------------------------
+        set_advertised_address("{{ ansible_host }}");
+        record_route_advertised_address("{{ ansible_host }}:{{ sip_port }}");
+    } else {
+        # Carrier and handoff: $ru is already the real destination, exactly as
+        # FreeSWITCH built it, and these dialogs really do leave the VPC.
+        #
+        # Same two-network split as route[DISPATCH] — see the long note there
+        # for the argument order and why one header cannot do it — but with
+        # the sides REVERSED, because this call travels the other way:
+        #
+        #   downstream  the carrier, which needs {{ kamailio_public_ip }}
+        #   upstream    FreeSWITCH, which needs {{ ansible_host }}
+        #
+        # So the arguments are swapped relative to route[DISPATCH]. They look
+        # like a copy-paste error side by side and are the opposite: writing
+        # them the same way in both places is the actual error.
+        record_route_preset("{{ kamailio_public_ip }}:{{ sip_port }}", "{{ ansible_host }}:{{ sip_port }}");
+    }
+
+    route(RELAY);
+}
+
+route[DISPATCH] {
+    # Anchor media before selecting a destination. RTPEngine rewrites the SDP
+    # to advertise {{ kamailio_public_ip }}, which is what keeps the private
+    # FreeSWITCH addresses out of anything the carrier sees.
+    route(MEDIA_OFFER);
+
+    # UNQUOTED, BOTH ARGUMENTS. ds_select_dst takes integers, and #!define is a
+    # preprocessor TOKEN substitution — it does not reach inside string
+    # literals. So "DS_FREESWITCH" stays the literal 13 characters instead of
+    # becoming {{ kamailio_dispatcher_set_freeswitch }}, and Kamailio fails at
+    # startup with
+    #
+    #   fixup_igp_igp(): Cannot convert function parameter 1 to
+    #                    FPARAM_INT | FPARAM_PVS
+    #
+    # naming a fixup function and a parameter index, not the define or the
+    # quotes. Algorithm 4 is round-robin across the set.
+    #
+    # `kamailio -c` DOES NOT CATCH THIS. It parses and reports "config file
+    # ok"; fixups only run during full module init, so the first sign is a
+    # service that will not start. Check a config change by starting the
+    # service, not by syntax-checking it.
+    if (!ds_select_dst(DS_FREESWITCH, 4)) {
+        xlog("L_ERR", "no FreeSWITCH destination available for did=$rU\n");
+        sl_send_reply("503", "No Backend Available");
+        exit;
+    }
+
+    # -----------------------------------------------------------------------
+    # DOUBLE RECORD-ROUTE, BECAUSE THIS DIALOG STRADDLES TWO NETWORKS.
+    #
+    # Its two ends cannot reach the same address, and no single Record-Route
+    # can serve both:
+    #
+    #   the carrier   is on the internet and can ONLY reach
+    #                 {{ kamailio_public_ip }}
+    #   FreeSWITCH    is in {{ sip_subnet_cidr }} with no public address, and
+    #                 can ONLY reach {{ ansible_host }}
+    #
+    # WHAT ONE PUBLIC RECORD-ROUTE DID. FreeSWITCH's route set named the
+    # Elastic IP, so every in-dialog request it originated left through the NAT
+    # gateway and arrived at the edge sourced from the NAT gateway instead of
+    # from its own address. The edge security group admits the farm by
+    # SECURITY GROUP REFERENCE, which matches only a private source, so those
+    # packets were dropped at the boundary.
+    #
+    # The one that matters is the BYE. When a call ends anywhere other than at
+    # the carrier — including when the AI agent decides to end it — FreeSWITCH
+    # tears the caller's leg down with a BYE in this direction. Lose it and the
+    # caller stays connected to a call that has already finished everywhere
+    # else.
+    #
+    # ARGUMENT ORDER IS (DOWNSTREAM, UPSTREAM), AND IS EASY TO GET BACKWARDS.
+    # Kamailio emits the first argument as the TOP header and the second below
+    # it. RFC 3261 then has the two ends read that same pair in OPPOSITE
+    # directions — §12.1.1 has the UAS take the list in order, §12.1.2 has the
+    # UAC take it reversed — so each end picks a different URI out of one
+    # message, which is the whole trick:
+    #
+    #   top     {{ ansible_host }}:{{ sip_port }}      FreeSWITCH is the UAS here and reads this one
+    #   bottom  {{ kamailio_public_ip }}:{{ sip_port }}      the carrier is the UAC and reads this one
+    #
+    # Swap them and both ends get the address the OTHER one needs. Every
+    # in-dialog request from either side then goes somewhere it cannot reach,
+    # and nothing looks wrong until a call tries to end.
+    #
+    # NOT record_route() PLUS AN ADVERTISED ADDRESS: that inserts one header,
+    # and one header cannot carry two addresses. The LiveKit leg in
+    # route[EGRESS] is the opposite case — both ends private, so one header is
+    # exactly right there.
+    # -----------------------------------------------------------------------
+    record_route_preset("{{ ansible_host }}:{{ sip_port }}", "{{ kamailio_public_ip }}:{{ sip_port }}");
+
+    t_on_failure("DISPATCH_FAILURE");
+    route(RELAY);
+}
+
+failure_route[DISPATCH_FAILURE] {
+    if (t_is_canceled()) {
+        exit;
+    }
+
+    # Try the next node in the set. With one FreeSWITCH node this does nothing,
+    # which is precisely the failover behaviour a single-node beta cannot
+    # exercise.
+    if (ds_next_dst()) {
+        route(RELAY);
+        exit;
+    }
+}
+
+route[MEDIA_OFFER] {
+    if (has_body("application/sdp")) {
+        rtpengine_manage("replace-origin replace-session-connection");
+    }
+}
+
+route[WITHINDLG] {
+    if (!loose_route()) {
+        sl_send_reply("404", "Not Here");
+        exit;
+    }
+
+    # MUST BE SET EVERY TIME, NOT JUST WHEN IT IS TRUE. $var is per PROCESS in
+    # Kamailio, not per message: a worker that handled a LiveKit request would
+    # otherwise still be carrying livekit_leg=1 when it picks up an unrelated
+    # carrier BYE, and would advertise a private address into a dialog that
+    # leaves the VPC. It is set outside the conditional below so it is
+    # initialised even in the configuration where LiveKit is absent entirely.
+    $var(livekit_leg) = 0;
+
+{% if livekit_sip_host | length > 0 %}
+    # -----------------------------------------------------------------------
+    # THE SAME PRIVATE-ADDRESS DECISION, FOR THE REQUESTS THAT COME AFTER.
+    #
+    # route[EGRESS] fixed the route set. This fixes the Via on every request
+    # that then travels it, and it is needed for its own reason: the route set
+    # decides where a request GOES, the Via decides where its RESPONSE comes
+    # back to. Getting one right and not the other gives a REFER that reaches
+    # FreeSWITCH and a 202 Accepted that never gets back — so livekit-sip
+    # retransmits and gives up, and the transfer fails at the last step with
+    # nothing in the FreeSWITCH log to say why.
+    #
+    # WHICH DIALOG IS THIS? Either end identifies the LiveKit leg:
+    #
+    #   src_ip    livekit-sip sending — the BYE when the agent ends the call,
+    #             and the REFER when it hands off.
+    #   $rd/$dd   FreeSWITCH sending to it. After loose_route() has stripped
+    #             our own Route header, the next hop is the remote target in
+    #             $ru; $dd covers the case where a destination URI was set
+    #             instead, and is empty rather than wrong when it was not.
+    #
+    # THIS COMPARISON NEEDS AN IP LITERAL. livekit_sip_host comes from the
+    # livekit group's ansible_host, which hosts.yml defines as the private
+    # address; a DNS name there would still render valid config that silently
+    # never matches, because $rd holds whatever is in the URI.
+    # -----------------------------------------------------------------------
+    if (src_ip == {{ livekit_sip_host }}
+            || $rd == "{{ livekit_sip_host }}"
+            || $dd == "{{ livekit_sip_host }}") {
+        $var(livekit_leg) = 1;
+        set_advertised_address("{{ ansible_host }}");
+    }
+{% endif %}
+
+    if (is_method("BYE")) {
+        # Release the media ports. Skipping this leaks the RTPEngine port range
+        # until a restart, and the symptom is call setup failing once the range
+        # is exhausted — at a call volume the box has handled fine before.
+        rtpengine_delete();
+    } else if (is_method("INVITE")) {
+        # Re-INVITE: re-anchor, because the SDP may have changed (hold,
+        # codec renegotiation).
+        #
+        # The same split as route[EGRESS], for the same reason — see the note
+        # there on why the advertised address does not reach this header by
+        # itself. A re-INVITE is the likely shape of what FreeSWITCH sends
+        # after a REFER, so this is on the handoff path, not a corner case.
+        if ($var(livekit_leg) == 1) {
+            record_route_advertised_address("{{ ansible_host }}:{{ sip_port }}");
+        } else {
+            record_route();
+        }
+        route(MEDIA_OFFER);
+    }
+
+    route(RELAY);
+}
+
+route[RELAY] {
+    if (!t_relay()) {
+        sl_reply_error();
+    }
+    exit;
+}
+
+onreply_route {
+    if (has_body("application/sdp")) {
+        rtpengine_manage("replace-origin replace-session-connection");
+    }
+}

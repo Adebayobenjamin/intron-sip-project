@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+#
+# env-file-to-sm — push a KEY=value .env file into an AWS Secrets Manager
+# container as a JSON object.
+#
+# Usage:
+#   env-file-to-sm <secret-id> <env-file>
+#
+# The container must already exist (Terraform owns its lifecycle; this script
+# owns only the value). That split is deliberate: no plaintext credential ever
+# lands in Terraform state.
+#
+# Reads are the inverse: bin/aws-env-run for operators, and
+# /usr/local/bin/fetch-and-render-secrets.sh on the VMs at service start.
+#
+# Authenticates as the klarity_aws profile in eu-central-1 by default, the same
+# identity the Makefiles and every Terraform provider block name. Override with
+# AWS_PROFILE / AWS_REGION. See the Identity block below — it is load-bearing
+# for a script that writes credentials.
+#
+# NOT bin/with-mfa. That wrapper has been deleted; see the note in
+# iac/Makefile for why, and what to do if MFA is ever required.
+
+set -euo pipefail
+
+secret_id="${1:?usage: $0 <secret-id> <env-file>}"
+env_file="${2:?usage: $0 <secret-id> <env-file>}"
+
+[[ -f "$env_file" ]] || { echo "env-file-to-sm: no such file: $env_file" >&2; exit 1; }
+
+for bin in aws jq; do
+  command -v "$bin" >/dev/null || {
+    echo "env-file-to-sm: '$bin' not found in PATH" >&2
+    exit 127
+  }
+done
+
+# --- Identity -------------------------------------------------------------
+#
+# DEFAULTED, NOT INHERITED, matching bin/db-dsn-to-sm and every Terraform
+# provider block in this repo. An override still wins, so
+# `AWS_PROFILE=other env-file-to-sm ...` behaves as expected.
+#
+# WHY THIS IS NOT COSMETIC. Without it the AWS CLI walks the default
+# credential chain, which on a laptop with several accounts configured is
+# whichever one happens to be active. This script WRITES A CREDENTIAL. Sending
+# it to the wrong account is the bad outcome, and the good version of that
+# mistake is the one that happened here first: ResourceNotFoundException,
+# because no secret of that name existed there. The bad version is a name
+# collision, where the push SUCCEEDS, reports success, and puts a production
+# credential in somebody else's account while the intended container stays
+# empty. The service then fails to start for a reason that looks nothing like
+# this.
+#
+# The profile deliberately carries no region (see ~/.aws/config), so AWS_REGION
+# has to be set too or every call fails with NoRegion.
+export AWS_PROFILE="${AWS_PROFILE:-klarity_aws}"
+export AWS_REGION="${AWS_REGION:-eu-central-1}"
+
+# Build the JSON object from the file. Comments and blanks are skipped; the
+# first `=` splits key from value, so values may contain `=` freely. Surrounding
+# single or double quotes are stripped — a .env written for `source` usually has
+# them and Secrets Manager consumers do not want them in the value.
+payload=$(
+  jq -Rn '
+    [ inputs
+      | select(test("^\\s*(#|$)") | not)
+      | capture("^\\s*(?:export\\s+)?(?<k>[A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(?<v>.*)$")
+      | .v |= sub("^\"(?<i>.*)\"$"; "\(.i)")
+      | .v |= sub("^'\''(?<i>.*)'\''$"; "\(.i)")
+      | {(.k): .v}
+    ] | add // {}
+  ' <"$env_file"
+)
+
+count=$(jq -r 'length' <<<"$payload")
+if [[ "$count" == "0" ]]; then
+  echo "env-file-to-sm: $env_file produced no keys — refusing to overwrite $secret_id with {}" >&2
+  exit 1
+fi
+
+# put-secret-value creates a NEW version and moves AWSCURRENT to it. The
+# previous version stays as AWSPREVIOUS, so a bad push is one
+# `update-secret-version-stage` away from being undone.
+aws secretsmanager put-secret-value \
+  --secret-id "$secret_id" \
+  --secret-string "$payload" \
+  --output json \
+  --query '{Name:Name,VersionId:VersionId}'
+
+echo "env-file-to-sm: wrote $count key(s) from $env_file to $secret_id"

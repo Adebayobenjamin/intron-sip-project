@@ -1,0 +1,120 @@
+{{ ansible_managed | comment }}
+# LiveKit: three containers, one unit.
+#
+# WHY COMPOSE HERE AND NOT IN app-service.
+# The app-service role deliberately avoids compose and runs each container
+# under its own systemd unit, so systemd sees the real exit status and always
+# runs ExecStop before killing anything. That reasoning is about ONE container
+# per unit with a drain requirement.
+#
+# This is three containers with a startup order and a shared network namespace,
+# and `docker compose up` in the FOREGROUND keeps the property that mattered:
+# systemd still owns the process and still runs ExecStop. What it adds is that
+# `depends_on` is expressed once rather than as three units with After= chains
+# that drift.
+
+services:
+  ########################################################
+  # Redis. LiveKit requires it even single-node.
+  #
+  # PERSISTENCE IS ON, AND IT IS NOT OPTIONAL. This is the ONLY durable state
+  # in the deployment: livekit-server keeps the SIP inbound trunk and dispatch
+  # rule here, under the keys `sip_inbound_trunk` and `sip_dispatch_rule`.
+  # There is no database behind it.
+  #
+  # This was `--save "" --appendonly no` on the reasoning that nothing durable
+  # lived here. That was wrong, and the way it surfaced is worth recording:
+  # restarting the stack to start livekit-sip wiped Redis, the trunk and rule
+  # vanished, and the next play recreated them with NEW ids - which looked
+  # like successful provisioning rather than data loss. Between a restart and
+  # the next play run, an inbound call has no trunk to match and is rejected.
+  #
+  # appendfsync everysec rather than always: the write rate here is a handful
+  # of config changes, so the durability difference is theoretical and the
+  # fsync-per-write cost is not worth paying on a shared volume.
+  #
+  # No published ports and no password: it listens on loopback inside the host
+  # namespace, and the security group opens nothing near 6379. Adding auth here
+  # would be a credential to rotate protecting a socket nothing can reach.
+  ########################################################
+  redis:
+    image: {{ livekit_redis_image }}
+    restart: unless-stopped
+    network_mode: host
+    command: >-
+      redis-server --bind 127.0.0.1 --port 6379
+      --dir /data
+      --appendonly yes --appendfsync everysec
+    volumes:
+      - {{ livekit_config_root }}/redis:/data
+
+  ########################################################
+  # The LiveKit server itself.
+  #
+  # network_mode: host, not a bridge. WebRTC needs {{ livekit_rtc_udp_port_max - livekit_rtc_udp_port_min }} UDP ports; publishing
+  # that range through Docker's userland proxy costs a process per port and
+  # measurable latency, and the bridge would rewrite the source address that
+  # ICE depends on. Every LiveKit deployment guide says host networking for
+  # this reason.
+  #
+  # Reads livekit.yaml - the RENDERED sibling of livekit.yaml.tpl, produced by
+  # the unit's ExecStartPre. If that step did not run, the file does not exist
+  # and the container exits immediately rather than starting without keys.
+  ########################################################
+  livekit:
+    image: {{ livekit_server_image }}
+    restart: unless-stopped
+    network_mode: host
+    command: --config /etc/livekit.yaml
+    volumes:
+      - {{ livekit_config_root }}/livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      - redis
+
+  ########################################################
+  # Caddy. TLS termination and the ACME client.
+  #
+  # The certificate store is a bind mount rather than a named volume so it
+  # survives `docker compose down -v` and is findable when debugging an issuance
+  # failure - a named volume puts it somewhere under /var/lib/docker that
+  # nobody looks in at 2am.
+  ########################################################
+  caddy:
+    image: {{ livekit_caddy_image }}
+    restart: unless-stopped
+    network_mode: host
+    command: run --config /etc/caddy.yaml --adapter yaml
+    volumes:
+      - {{ livekit_config_root }}/caddy.yaml:/etc/caddy.yaml:ro
+      - {{ livekit_config_root }}/caddy_data:/data
+    depends_on:
+      - livekit
+{% if livekit_sip_enabled | default(true) %}
+
+  ########################################################
+  # livekit-sip. Where a phone call becomes a room participant.
+  #
+  # Host networking for the same reason as livekit-server, plus one of its
+  # own: SIP carries addresses in its payload, and a bridge NAT would rewrite
+  # the source of the INVITE so livekit-sip could not tell which trunk it
+  # came from. Trunk matching is by source address.
+  #
+  # Reads sip.yaml - the RENDERED sibling of sip.yaml.tpl, produced by the
+  # unit's ExecStartPre. Without that step the file does not exist and the
+  # container exits rather than starting without credentials.
+  #
+  # NO depends_on: redis ALONE. It needs livekit-server too - it connects to
+  # it over ws:// on loopback to create room participants, and starting first
+  # means a retry loop on every deploy.
+  ########################################################
+  sip:
+    image: {{ livekit_sip_image }}
+    restart: unless-stopped
+    network_mode: host
+    command: --config /etc/sip.yaml
+    volumes:
+      - {{ livekit_config_root }}/sip.yaml:/etc/sip.yaml:ro
+    depends_on:
+      - redis
+      - livekit
+{% endif %}

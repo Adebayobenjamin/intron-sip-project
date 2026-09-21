@@ -1,0 +1,17 @@
+---
+# Installed by `make galaxy`.
+collections:
+  # Provides community.aws.aws_ssm — the connection plugin every play in this
+  # repo runs over. Without it, ansible_connection: community.aws.aws_ssm in
+  # group_vars/all.yml fails at the first task with "the connection plugin
+  # was not found", which reads like a typo rather than a missing dependency.
+  - name: community.aws
+  - name: amazon.aws
+
+  # ansible.posix.sysctl for the network buffer tuning in the common role.
+  - name: ansible.posix
+
+  # community.general.timezone, and the docker modules the app-service role
+  # uses to run containers from ECR.
+  - name: community.general
+  - name: community.docker

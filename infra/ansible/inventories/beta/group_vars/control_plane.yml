@@ -1,0 +1,164 @@
+---
+########################################################
+# App tier — ESL controller + control-plane API.
+#
+# Both run as containers from ECR, one systemd unit each. The unit pulls the
+# pinned tag at start and the instance profile handles ECR auth, so there is no
+# registry credential to distribute and nothing is built on the box.
+########################################################
+
+# Account 023585529698 — from the ecr stack's repository_urls output.
+ecr_registry: "023585529698.dkr.ecr.{{ aws_region }}.amazonaws.com"
+
+########################################################
+# Services. Each entry becomes one systemd unit.
+#
+# `image_tag` IS THE DEPLOY. ECR repositories are created with IMMUTABLE tags,
+# so a tag names exactly one set of bytes forever — which is what makes
+# rollback meaningful and what stops two nodes running different code under the
+# same tag. Bump it here and run the play.
+#
+# `long_lived_connections` widens the SIGTERM grace period. It is NOT a drain:
+# the controller holds a TCP socket for the life of every call, and with one
+# instance and no load balancer a restart ends those calls. The flag only gives
+# the app time to close them cleanly rather than being killed mid-write.
+#
+# THE ORDER MATTERS, AND CONTROL-PLANE MUST COME FIRST.
+#
+# control-plane is the only migrator. esl-controller refuses to start against a
+# schema older than the build it was compiled from — deliberately, because the
+# alternative is a controller that starts, queries a column that does not exist
+# and fails one call at a time, which reads as an intermittent fault rather than
+# a deploy done in the wrong order.
+#
+# On a FRESH database that is exactly the state until control-plane has
+# migrated. The role starts every service in this order before probing any of
+# them, so with the controller first it exits, systemd retries it on RestartSec
+# (5s), and it recovers once the migration lands — usually.
+#
+# Usually is the problem. StartLimitBurst is 5 in 600s: a first migration
+# against a cold RDS instance can outlast five retries, and the unit then sits
+# in `failed` permanently while the play's health probe waits 150s for an
+# endpoint that will never answer. Starting the migrator first removes the race
+# rather than relying on winning it.
+########################################################
+app_services:
+  - name: control-plane
+    repository: intron-sip/control-plane
+    image_tag: v0.1.2
+    secret_id: "{{ control_plane_secret_id }}"
+    health_port: "{{ control_plane_health_port }}"
+    ports:
+      - "{{ api_listener_port }}:{{ api_listener_port }}"
+      - "{{ control_plane_health_port }}:{{ control_plane_health_port }}"
+    # Ordinary HTTP. Requests in flight are milliseconds.
+    long_lived_connections: false
+
+  - name: esl-controller
+    repository: intron-sip/esl-controller
+    image_tag: v0.1.2
+    secret_id: "{{ esl_controller_secret_id }}"
+    health_port: "{{ esl_controller_health_port }}"
+    ports:
+      - "{{ esl_listener_port }}:{{ esl_listener_port }}"
+      - "{{ esl_controller_health_port }}:{{ esl_controller_health_port }}"
+    # Holds a TCP socket per call. There is no drain (no load balancer to
+    # drain to at one instance) - this only widens the SIGTERM grace period so
+    # the app can close sockets cleanly instead of being killed mid-write.
+    long_lived_connections: true
+
+########################################################
+# Ports. Must match iac/stacks/control-plane — the security groups, the
+# listeners and the target groups are all built from the Terraform values.
+########################################################
+esl_listener_port: 8022
+api_listener_port: 8080
+
+########################################################
+# A HEALTH PORT PER SERVICE, NOT ONE SHARED app_health_port.
+#
+# Both containers run --network host on the SAME instance, so they share one
+# port namespace. A single shared value meant both units rendered 8088 and the
+# second container to start could not bind — it fails, the first stays healthy,
+# and from outside the instance everything looks fine.
+#
+# Neither port is reachable from off the box: the app security group does not
+# admit them, and nothing load-balances to them. The Ansible role curls the
+# endpoint over loopback after a deploy; that is the only consumer.
+########################################################
+control_plane_health_port: 8088
+esl_controller_health_port: 8089
+health_check_path: /healthz
+
+########################################################
+# Postgres pool size for the ESL controller.
+#
+# The controller now holds its own database credential and does admission and
+# every call-state write directly (docs/API.md, Contracts 1 and 2), so it is a
+# database client in its own right rather than an HTTP client of one.
+#
+# Kept small deliberately. db.t4g.micro has a low max_connections, and TWO
+# services now share it — a generous pool here starves the control plane, and
+# the failure is "cannot connect" on whichever asks second.
+########################################################
+esl_controller_db_max_conns: 10
+
+########################################################
+# The control plane's pool, sized against the SAME ceiling.
+#
+# db.t4g.micro has 1 GiB of RAM, which is roughly 110 Postgres connections in
+# total. These two numbers plus whatever an operator's psql session takes must
+# fit inside it, so they are set here together rather than each service taking
+# a driver default and discovering the overlap in production.
+#
+# Smaller than the controller's on purpose: this one serves human-paced CRUD,
+# while the controller queries on every inbound call. Exhausting the ceiling
+# fails as `FATAL: sorry, too many clients already` on whichever service starts
+# second — a message that names nothing about instance memory.
+########################################################
+control_plane_db_max_conns: 6
+
+########################################################
+# ESL socket keepalive — THE PRIMARY DEFENCE, not the NLB attribute.
+#
+# An NLB reaps a TCP flow after its idle timeout with no packets in either
+# direction, and an `async full` ESL socket can genuinely go that quiet: a
+# caller on hold with FreeSWITCH playing music generates no events the
+# controller has subscribed to. When the flow is reaped the socket dies with no
+# FIN, and calls drop at suspiciously round intervals.
+#
+# The Terraform side raises the NLB's timeout to 1200s, but that only defends
+# against THAT middlebox. A keepalive well under the timeout defends against
+# every one in the path, now and later. The controller should apply this to
+# accepted sockets — in Go, net.ListenConfig{KeepAlive: ...}.
+#
+# Passed into the container as an env var so it does not need a rebuild to
+# change.
+esl_tcp_keepalive_seconds: 60
+
+########################################################
+# SIGTERM grace period for the ESL controller.
+#
+# NOT a drain - there is no load balancer and no peer to move traffic to, so a
+# restart ends the calls this node is holding. This is simply how long Docker
+# waits after SIGTERM before SIGKILL, giving the app a chance to close its
+# sockets and flush state rather than dying mid-write.
+#
+# Worth nothing unless the container actually handles SIGTERM. If it ignores
+# the signal, this delays the kill by two minutes and changes nothing else.
+########################################################
+app_stop_grace_seconds: 120
+
+# Docker from Docker's own apt repository rather than Debian's docker.io,
+# which lags and has surprised people with compose plugin differences.
+docker_apt_repo: "https://download.docker.com/linux/debian"
+
+# Container logs go to journald, which the CloudWatch agent ships. NOT to
+# docker's default json-file driver: that writes to the root volume with no
+# rotation by default, and a chatty service fills the disk and takes the SSM
+# agent down with it.
+docker_log_driver: journald
+
+# The app tier handles no media and absorbs no UDP bursts — the SIP tuning in
+# the common role would be noise here.
+tune_network_buffers: false
