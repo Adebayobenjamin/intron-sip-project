@@ -1,7 +1,7 @@
 variable "aws_region" {
   type        = string
   description = "Region. ECR is regional and a cross-region pull costs egress, so this must match where the app tier runs."
-  default     = "eu-central-1"
+  default     = "eu-west-1"
 }
 
 variable "aws_profile" {
@@ -31,5 +31,5 @@ variable "aws_profile" {
     but means any bare `aws` CLI call needs AWS_REGION set. The Makefile
     exports it.
   DESC
-  default     = "klarity_aws"
+  default     = "intron_aws"
 }

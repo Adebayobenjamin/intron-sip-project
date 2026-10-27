@@ -2,33 +2,33 @@ package handlers
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 
+	"github.com/Adebayobenjamin/intron-sip-project/services/internal/numrange"
 	"github.com/Adebayobenjamin/intron-sip-project/services/internal/route"
 	"github.com/Adebayobenjamin/intron-sip-project/services/internal/store"
 )
 
 // Trunks is the store, narrowed.
 type Trunks interface {
-	CreateTrunk(ctx context.Context, t store.Trunk) (store.Trunk, error)
+	CreateTrunk(ctx context.Context, t store.Trunk, ranges []numrange.Bounds) (store.Trunk, error)
 	GetTrunk(ctx context.Context, id int64, tenantID string) (store.Trunk, error)
-	DIDNumbersByTrunk(ctx context.Context, trunkID int64) ([]string, error)
 	ListTrunks(ctx context.Context, tenantID string) ([]store.Trunk, error)
 	UpdateTrunk(ctx context.Context, id int64, tenantID string, u store.TrunkUpdate) (store.Trunk, error)
 	DeleteTrunk(ctx context.Context, id int64, tenantID string) error
 
 	CreateHandoffTarget(ctx context.Context, h store.HandoffTarget) (store.HandoffTarget, error)
 	ListHandoffTargets(ctx context.Context, tenantID string) ([]store.HandoffTarget, error)
-	UpdateHandoffTarget(ctx context.Context, id int64, tenantID string, name, kind, destination *string, priority *int, enabled *bool) (store.HandoffTarget, error)
+	UpdateHandoffTarget(ctx context.Context, id int64, tenantID string, u store.HandoffTargetUpdate) (store.HandoffTarget, error)
 	DeleteHandoffTarget(ctx context.Context, id int64, tenantID string) error
 }
 
 // TrunksHandler serves trunks and handoff targets.
 type TrunksHandler struct {
-	Store Trunks
-	Log   *slog.Logger
+	Store     Trunks
+	Admission Invalidator
+	Log       *slog.Logger
 }
 
 // createdTrunk carries a warning with the created row.
@@ -53,23 +53,21 @@ func (h TrunksHandler) CreateTrunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		TenantID        string   `json:"tenant_id"`
-		Slug            string   `json:"slug"`
-		Name            string   `json:"name"`
-		Type            string   `json:"type"`
-		Carrier         string   `json:"carrier"`
-		Status          string   `json:"status"`
-		IsDefault       bool     `json:"is_default"`
-		SIPHost         string   `json:"sip_host"`
-		SIPPort         int      `json:"sip_port"`
-		SIPUsername     string   `json:"sip_username"`
-		SIPPassword     string   `json:"sip_password"`
-		SIPAuthMethod   string   `json:"sip_auth_method"`
-		SignallingCIDRs []string `json:"signalling_cidrs"`
-		MediaCIDRs      []string `json:"media_cidrs"`
-		ChannelSize     *int     `json:"channel_size"`
-		CallerIDFormat  string   `json:"caller_id_format"`
-		TwilioTrunkSID  string   `json:"twilio_trunk_sid"`
+		TenantID        string           `json:"tenant_id"`
+		Slug            string           `json:"slug"`
+		Name            string           `json:"name"`
+		Carrier         string           `json:"carrier"`
+		Status          string           `json:"status"`
+		DIDRanges       []numrange.Range `json:"did_ranges"`
+		SIPHost         string           `json:"sip_host"`
+		SIPPort         int              `json:"sip_port"`
+		SIPUsername     string           `json:"sip_username"`
+		SIPPassword     string           `json:"sip_password"`
+		SIPAuthMethod   string           `json:"sip_auth_method"`
+		SignallingCIDRs []string         `json:"signalling_cidrs"`
+		MediaCIDRs      []string         `json:"media_cidrs"`
+		ChannelSize     *int             `json:"channel_size"`
+		CallerIDFormat  string           `json:"caller_id_format"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -86,8 +84,9 @@ func (h TrunksHandler) CreateTrunk(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "slug, name and carrier are required")
 		return
 	}
-	if !validTrunkType(req.Type) {
-		fail(w, http.StatusBadRequest, "type must be one of: inbound, outbound, bi_directional")
+	_, bounds, err := numrange.ParseAll(req.DIDRanges)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !validAuthMethod(req.SIPAuthMethod) {
@@ -113,22 +112,26 @@ func (h TrunksHandler) CreateTrunk(w http.ResponseWriter, r *http.Request) {
 
 	t, err := h.Store.CreateTrunk(r.Context(), store.Trunk{
 		TenantID: tenant, Slug: req.Slug, Name: req.Name,
-		Type: req.Type, Carrier: req.Carrier, Status: req.Status,
-		IsDefault: req.IsDefault,
-		SIPHost:   req.SIPHost, SIPPort: req.SIPPort, SIPUsername: req.SIPUsername,
+		Carrier: req.Carrier, Status: req.Status,
+		SIPHost: req.SIPHost, SIPPort: req.SIPPort, SIPUsername: req.SIPUsername,
 		SIPAuthMethod:   req.SIPAuthMethod,
 		SignallingCIDRs: req.SignallingCIDRs, MediaCIDRs: req.MediaCIDRs,
 		ChannelSize: req.ChannelSize, CallerIDFormat: req.CallerIDFormat,
-		TwilioTrunkSID: req.TwilioTrunkSID,
-	})
+	}, bounds)
 	if err != nil {
 		failErr(w, h.Log, "create trunk", err)
 		return
 	}
 
+	invalidateAll(h.Admission)
 	h.Log.Info("trunk created", "slug", t.Slug, "carrier", t.Carrier, "by", p.Label)
 
 	resp := createdTrunk{Trunk: t}
+	if len(t.DIDRanges) == 0 {
+		resp.NextSteps = append(resp.NextSteps,
+			"did_ranges is empty: record the numbers this trunk carries, then add traffic "+
+				"configs for them — until then every call on this trunk is refused as an unknown number")
+	}
 	if len(t.SignallingCIDRs) > 0 {
 		resp.NextSteps = append(resp.NextSteps,
 			"add these signalling_cidrs to TF_VAR_carrier_sip_cidrs and apply the "+
@@ -185,7 +188,9 @@ func (h TrunksHandler) UpdateTrunk(w http.ResponseWriter, r *http.Request) {
 		ChannelSize      *int     `json:"channel_size"`
 		ClearChannelSize bool     `json:"clear_channel_size"`
 		SIPPassword      string   `json:"sip_password"`
-		TwilioTrunkSID   *string  `json:"twilio_trunk_sid"`
+
+		// Replaces the inventory. Refused if it drops numbers a line uses.
+		DIDRanges *[]numrange.Range `json:"did_ranges"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -197,17 +202,28 @@ func (h TrunksHandler) UpdateTrunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, err := h.Store.UpdateTrunk(r.Context(), id, tenant, store.TrunkUpdate{
+	u := store.TrunkUpdate{
 		Name: req.Name, Status: req.Status,
 		SIPHost: req.SIPHost, SIPPort: req.SIPPort,
 		SignallingCIDRs: req.SignallingCIDRs, MediaCIDRs: req.MediaCIDRs,
 		ChannelSize: req.ChannelSize, ClearChannelSize: req.ClearChannelSize,
-		TwilioTrunkSID: req.TwilioTrunkSID,
-	})
+	}
+	if req.DIDRanges != nil {
+		_, bounds, err := numrange.ParseAll(*req.DIDRanges)
+		if err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		u.DIDRanges = &bounds
+	}
+
+	t, err := h.Store.UpdateTrunk(r.Context(), id, tenant, u)
 	if err != nil {
 		failErr(w, h.Log, "update trunk", err)
 		return
 	}
+
+	invalidateAll(h.Admission)
 
 	if req.SignallingCIDRs != nil {
 		// Loud, because the half that is not in this database is the half
@@ -233,28 +249,17 @@ func (h TrunksHandler) DeleteTrunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := h.Store.DeleteTrunk(r.Context(), id, tenant)
-	if errors.Is(err, store.ErrInUse) {
-		// 409, not 404 or 500: the request is well formed and the row exists,
-		// and the caller can fix it by repointing the DIDs first.
-		fail(w, http.StatusConflict, err.Error())
-		return
-	}
-	if err != nil {
+	// Refused with 409 while lines still sit on the trunk — the database's
+	// rule, mapped by failErr. The caller fixes it by moving or deleting the
+	// lines first.
+	if err := h.Store.DeleteTrunk(r.Context(), id, tenant); err != nil {
 		failErr(w, h.Log, "delete trunk", err)
 		return
 	}
 
+	invalidateAll(h.Admission)
 	h.Log.Warn("trunk deleted", "id", id, "by", p.Label)
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func validTrunkType(t string) bool {
-	switch t {
-	case "inbound", "outbound", "bi_directional":
-		return true
-	}
-	return false
 }
 
 func validAuthMethod(m string) bool {
@@ -276,7 +281,12 @@ func (h TrunksHandler) CreateHandoffTarget(w http.ResponseWriter, r *http.Reques
 	}
 
 	var req struct {
-		TenantID    string `json:"tenant_id"`
+		TenantID string `json:"tenant_id"`
+
+		// TrafficConfigID makes this an override for one line rather than part
+		// of the tenant's default list.
+		TrafficConfigID *int64 `json:"traffic_config_id"`
+
 		Name        string `json:"name"`
 		Kind        string `json:"kind"`
 		Destination string `json:"destination"`
@@ -309,7 +319,8 @@ func (h TrunksHandler) CreateHandoffTarget(w http.ResponseWriter, r *http.Reques
 	}
 
 	t, err := h.Store.CreateHandoffTarget(r.Context(), store.HandoffTarget{
-		TenantID: tenant, Name: req.Name, Kind: req.Kind,
+		TenantID: tenant, TrafficConfigID: req.TrafficConfigID,
+		Name: req.Name, Kind: req.Kind,
 		Destination: req.Destination, Priority: req.Priority, Enabled: enabled,
 	})
 	if err != nil {
@@ -360,6 +371,10 @@ func (h TrunksHandler) UpdateHandoffTarget(w http.ResponseWriter, r *http.Reques
 		Destination *string `json:"destination"`
 		Priority    *int    `json:"priority"`
 		Enabled     *bool   `json:"enabled"`
+
+		// Move onto a line's override list, or back to the tenant default.
+		TrafficConfigID    *int64 `json:"traffic_config_id"`
+		ClearTrafficConfig bool   `json:"clear_traffic_config"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -370,8 +385,16 @@ func (h TrunksHandler) UpdateHandoffTarget(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	t, err := h.Store.UpdateHandoffTarget(r.Context(), id, tenant,
-		req.Name, req.Kind, req.Destination, req.Priority, req.Enabled)
+	if req.TrafficConfigID != nil && req.ClearTrafficConfig {
+		fail(w, http.StatusBadRequest, "set traffic_config_id or clear_traffic_config, not both")
+		return
+	}
+
+	t, err := h.Store.UpdateHandoffTarget(r.Context(), id, tenant, store.HandoffTargetUpdate{
+		Name: req.Name, Kind: req.Kind, Destination: req.Destination,
+		Priority: req.Priority, Enabled: req.Enabled,
+		TrafficConfigID: req.TrafficConfigID, ClearTrafficConfig: req.ClearTrafficConfig,
+	})
 	if err != nil {
 		failErr(w, h.Log, "update handoff target", err)
 		return

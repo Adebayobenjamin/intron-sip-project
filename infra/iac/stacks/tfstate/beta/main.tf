@@ -39,7 +39,7 @@
 #
 # There is no Makefile target for this stack: the Makefile wraps every other
 # stack in aws-env-run, which reads the iac secret — and that does not exist
-# yet either. Credentials come from the klarity_aws profile named in the
+# yet either. Credentials come from the intron_aws profile named in the
 # provider block below, so nothing needs to be exported first.
 ########################################################
 
@@ -54,12 +54,12 @@ terraform {
   # everything else — this stack is not special once it has a home.
   ########################################################
   backend "s3" {
-    bucket       = "intron-sip-tfstate-eu-central-1"
+    bucket       = "intron-sip-tfstate-eu-west-1"
     key          = "stacks/tfstate/beta/terraform.tfstate"
-    region       = "eu-central-1"
+    region       = "eu-west-1"
     encrypt      = true
     use_lockfile = true
-    profile      = "klarity_aws"
+    profile      = "intron_aws"
   }
 
   required_providers {

@@ -31,7 +31,7 @@
 #   FS_CLI_HOST              ESL listen address     (default 127.0.0.1)
 #   FS_CLI_PORT              ESL listen port        (default 8021)
 #   FS_ESL_PASSWORD_FIELD    key within the secret  (default FREESWITCH_ESL_PASSWORD)
-#   AWS_REGION               region for the SM call (default eu-central-1)
+#   AWS_REGION               region for the SM call (default eu-west-1)
 #
 # Exit codes:
 #   0  success
@@ -47,7 +47,7 @@ dest="${2:-/etc/fs_cli.conf}"
 field="${FS_ESL_PASSWORD_FIELD:-FREESWITCH_ESL_PASSWORD}"
 cli_host="${FS_CLI_HOST:-127.0.0.1}"
 cli_port="${FS_CLI_PORT:-8021}"
-aws_region="${AWS_REGION:-eu-central-1}"
+aws_region="${AWS_REGION:-eu-west-1}"
 
 # The v2 CLI installs to /usr/local/bin, which is not on the PATH systemd gives
 # a unit. Add it rather than hardcoding the path, so this still works if the

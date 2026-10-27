@@ -58,8 +58,13 @@ func TestClaim_TakenForAdmittedCalls(t *testing.T) {
 	}
 
 	c := claims[0]
-	if c.TenantID != "t_acme" || c.PlanID != "p_main" {
+	if c.TenantID != "t_acme" || c.TrafficConfigID != 21 || c.TrunkID != 9 {
 		t.Errorf("claim did not carry the verdict: %+v", c)
+	}
+	// The recording mode is snapshotted onto the slot here, at the start of
+	// the call. A transferred leg reads it back from this row.
+	if c.RecordingMode != "ai_only" {
+		t.Errorf("RecordingMode = %q, want ai_only snapshotted from the line", c.RecordingMode)
 	}
 	if c.Direction != calls.DirectionInbound {
 		t.Errorf("Direction = %q, want inbound", c.Direction)

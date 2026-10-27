@@ -9,13 +9,12 @@ import "strings"
 //
 // Numbers arrive in whatever shape the carrier chose. Twilio sends
 // +4930123456; a BYOT SBC may send 004930123456, or 4930123456, or the same
-// with spaces in it. Storing whatever arrived means the unique index on
-// dids.number does not actually stop two rows describing one number, and a
-// lookup misses for a DID that is plainly present when a human looks at the
-// table.
+// with spaces in it. A block of numbers entered in one shape and a call
+// arriving in another must still meet, or a lookup misses for a number that is
+// plainly configured when a human looks at the table.
 //
-// So every write normalises and every read normalises, and the index is then
-// meaningful.
+// So every write normalises (see internal/numrange) and every read normalises,
+// and the comparison is then meaningful.
 //
 // # The assumption, stated because it will eventually be wrong
 //

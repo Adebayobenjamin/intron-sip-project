@@ -35,15 +35,15 @@ func TestLoadControlPlane_ReportsEveryMissingKeyAtOnce(t *testing.T) {
 	}
 }
 
-func TestLoadControlPlane_TwilioIsOptional(t *testing.T) {
+// Carrier credentials are not read at all. A leftover variable from an older
+// env file must not stop the service starting.
+func TestLoadControlPlane_IgnoresCarrierCredentials(t *testing.T) {
 	setControlPlaneEnv(t)
+	t.Setenv("TWILIO_ACCOUNT_SID", "AC-leftover")
+	t.Setenv("TWILIO_AUTH_TOKEN", "leftover")
 
-	cfg, err := LoadControlPlane()
-	if err != nil {
-		t.Fatalf("Twilio credentials are optional, got: %v", err)
-	}
-	if cfg.TwilioAccountSID != "" {
-		t.Errorf("want empty SID, got %q", cfg.TwilioAccountSID)
+	if _, err := LoadControlPlane(); err != nil {
+		t.Fatalf("a leftover carrier variable stopped the service: %v", err)
 	}
 }
 
@@ -161,9 +161,7 @@ func clearControlPlaneEnv(t *testing.T) {
 		"APP_ENV", "AWS_REGION", "NODE_ID",
 		"DATABASE_URL", "DATABASE_MAX_CONNS",
 		"API_LISTEN_ADDR", "CONTROL_PLANE_API_TOKEN",
-		"TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN",
-		"TWILIO_API_KEY_SID", "TWILIO_API_KEY_SECRET",
-		"EDGE_SIP_URI", "HEALTH_LISTEN_ADDR", "HEALTH_PATH",
+		"HEALTH_LISTEN_ADDR", "HEALTH_PATH",
 	} {
 		t.Setenv(k, "")
 	}
@@ -174,11 +172,9 @@ func setControlPlaneEnv(t *testing.T) {
 	clearControlPlaneEnv(t)
 
 	t.Setenv("APP_ENV", "test")
-	t.Setenv("AWS_REGION", "eu-central-1")
+	t.Setenv("AWS_REGION", "eu-west-1")
 	t.Setenv("DATABASE_URL", "postgres://localhost/test")
 	t.Setenv("CONTROL_PLANE_API_TOKEN", "token")
-	t.Setenv("TWILIO_ACCOUNT_SID", "")
-	t.Setenv("TWILIO_AUTH_TOKEN", "")
 }
 
 // clearEslControllerEnv unsets every key LoadEslController reads.
@@ -202,7 +198,7 @@ func setEslControllerEnv(t *testing.T) {
 	clearEslControllerEnv(t)
 
 	t.Setenv("APP_ENV", "test")
-	t.Setenv("AWS_REGION", "eu-central-1")
+	t.Setenv("AWS_REGION", "eu-west-1")
 	t.Setenv("DATABASE_URL", "postgres://localhost/test")
 	t.Setenv("FREESWITCH_NODES", "10.70.20.10")
 	t.Setenv("FREESWITCH_ESL_PASSWORD", "password")
@@ -242,60 +238,5 @@ func TestLoadControlPlane_DoesNotRequireAJWTKey(t *testing.T) {
 
 	if _, err := LoadControlPlane(); err != nil {
 		t.Fatalf("control-plane must start without a JWT key: %v", err)
-	}
-}
-
-// An API key is preferred over the account auth token: the token authenticates
-// every call and is what you rotate if it leaks, which breaks every
-// integration at once.
-func TestLoadControlPlane_PrefersATwilioAPIKey(t *testing.T) {
-	setControlPlaneEnv(t)
-	t.Setenv("TWILIO_ACCOUNT_SID", "AC1")
-	t.Setenv("TWILIO_AUTH_TOKEN", "account-token")
-	t.Setenv("TWILIO_API_KEY_SID", "SK1")
-	t.Setenv("TWILIO_API_KEY_SECRET", "key-secret")
-
-	cfg, err := LoadControlPlane()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	user, pass := cfg.TwilioAuth()
-	if user != "SK1" || pass != "key-secret" {
-		t.Errorf("auth = %q/%q, want the API key", user, pass)
-	}
-	if !cfg.TwilioConfigured() {
-		t.Error("want TwilioConfigured true")
-	}
-}
-
-// With no key issued, the account auth token still works.
-func TestLoadControlPlane_FallsBackToTheAuthToken(t *testing.T) {
-	setControlPlaneEnv(t)
-	t.Setenv("TWILIO_ACCOUNT_SID", "AC1")
-	t.Setenv("TWILIO_AUTH_TOKEN", "account-token")
-
-	cfg, err := LoadControlPlane()
-	if err != nil {
-		t.Fatal(err)
-	}
-	user, pass := cfg.TwilioAuth()
-	if user != "AC1" || pass != "account-token" {
-		t.Errorf("auth = %q/%q, want the account credentials", user, pass)
-	}
-}
-
-// Twilio absent entirely is the current state, and must not stop the service.
-func TestLoadControlPlane_TwilioAbsentIsFine(t *testing.T) {
-	setControlPlaneEnv(t)
-	t.Setenv("TWILIO_ACCOUNT_SID", "")
-	t.Setenv("TWILIO_AUTH_TOKEN", "")
-
-	cfg, err := LoadControlPlane()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.TwilioConfigured() {
-		t.Error("want TwilioConfigured false")
 	}
 }

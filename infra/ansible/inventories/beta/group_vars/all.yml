@@ -1,6 +1,6 @@
 ---
 env_name: beta
-aws_region: eu-central-1
+aws_region: eu-west-1
 
 ########################################################
 # AWS SSM connection transport
@@ -24,7 +24,7 @@ aws_region: eu-central-1
 #   ENV=beta EXTRA="-raw operator_iam_policy_snippet"` prints the statements.
 #   Not needed while that identity holds AdministratorAccess, which it does.
 #
-# CREDENTIALS: the klarity_aws profile, named below rather than inherited from
+# CREDENTIALS: the intron_aws profile, named below rather than inherited from
 # the environment. Same reasoning as the Terraform provider — an auth model
 # that only works through the Makefile breaks the first time someone runs
 # ansible-playbook directly, and it fails by reaching for whatever AWS_PROFILE
@@ -35,9 +35,9 @@ aws_region: eu-central-1
 # overrides session credentials anyway.
 ########################################################
 ansible_connection: community.aws.aws_ssm
-ansible_aws_ssm_profile: klarity_aws
+ansible_aws_ssm_profile: intron_aws
 ansible_aws_ssm_region: "{{ aws_region }}"
-ansible_aws_ssm_bucket_name: intron-ansible-ssm-beta-eu-central-1
+ansible_aws_ssm_bucket_name: intron-ansible-ssm-beta-eu-west-1
 ansible_python_interpreter: /usr/bin/python3
 
 # Default user the plugin's SendCommand runs as. Plays use `become: true` to

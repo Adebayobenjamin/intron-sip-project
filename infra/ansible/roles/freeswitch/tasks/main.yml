@@ -486,20 +486,30 @@
         port: "{{ freeswitch_esl_outbound_target.split(':')[1] | int }}"
         timeout: 30
       register: esl_reachable
+      # Swallowed here so the next task can fail with a useful message. That
+      # means `esl_reachable is failed` is ALWAYS false — failed_when rewrites
+      # the flag — so the guard below keys on `state`, which wait_for only
+      # returns on success. Keying on `is failed` made the guard dead code: the
+      # probe timed out against an undeployed controller and the play passed.
       failed_when: false
 
     - name: Fail with the actual cause if the ESL controller is unreachable
       ansible.builtin.fail:
         msg: >-
           Cannot reach {{ freeswitch_esl_outbound_target }} from
-          {{ inventory_hostname }}. Every inbound call will be dropped at answer
-          with nothing logged on the controller side. Check, in this order:
-          (1) is the control-plane container actually running? There is no load
-          balancer — this resolves straight to the app instance, so a refused
-          connection means nothing is listening;
+          {{ inventory_hostname }} ({{ esl_reachable.msg | default('no detail') }}).
+          Every inbound call will be dropped at answer with nothing logged on
+          the controller side. Check, in this order:
+          (1) is the esl-controller container actually running? There is no
+          load balancer — this resolves straight to the app instance;
           (2) freeswitch_esl_outbound_target in group_vars/all.yml matches
           `make output STACK=control-plane ENV={{ env_name }} EXTRA="-raw esl_target"`;
           (3) the app security group admits the FreeSWITCH security group on
           {{ freeswitch_esl_outbound_target.split(':')[1] }}.
-          A TIMEOUT points at (3); CONNECTION REFUSED points at (1).
-      when: esl_reachable is failed
+          wait_for retries refused connections and DNS failures until the
+          timeout, so every cause reads as a timeout here. To tell them apart,
+          from this node: `getent hosts {{ freeswitch_esl_outbound_target.split(':')[0] }}`
+          (no output = DNS), then
+          `timeout 5 bash -c 'exec 3<>/dev/tcp/{{ freeswitch_esl_outbound_target.split(':')[0] }}/{{ freeswitch_esl_outbound_target.split(':')[1] }}'`
+          ("Connection refused" = nothing listening, (1); exit 124 = dropped, (3)).
+      when: esl_reachable.state is not defined

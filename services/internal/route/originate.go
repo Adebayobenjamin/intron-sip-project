@@ -2,14 +2,24 @@ package route
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
+
+// TransferContext is the FreeSWITCH dialplan context a transferred call lands
+// in. It is the name of the context in
+// infra/ansible/roles/freeswitch/templates/dialplan-public.xml.j2 — the one
+// inbound calls arrive in, whose catch-all hands every call to the controller.
+const TransferContext = "public"
 
 // OriginateParams is what an outbound dial string needs.
 type OriginateParams struct {
 	CallUUID string
 	TenantID string
-	PlanID   string
+
+	// TrafficConfigID is the outbound line the from-number belongs to. The
+	// answered socket reads it back to know what to connect the customer to.
+	TrafficConfigID int64
 
 	// FromDID is the number the call presents. Validated as owned-and-active
 	// before it gets here — a carrier checks that the calling number belongs
@@ -19,8 +29,12 @@ type OriginateParams struct {
 	// ToNumber is who to ring.
 	ToNumber string
 
-	// TrunkHost is the carrier's SIP host, taken from the from-DID's trunk.
+	// TrunkHost is the carrier's SIP host, taken from the outbound line's trunk.
 	TrunkHost string
+
+	// TrunkPort is the carrier's SIP port. Zero or 5060 leaves it out of the
+	// URI, so the common case reads exactly as it did before.
+	TrunkPort int
 
 	// CallbackTarget is where FreeSWITCH opens its per-call socket once the
 	// far end answers — the controller's own DNS name, the same one the
@@ -110,6 +124,45 @@ func Originate(p OriginateParams) (string, error) {
 		// -------------------------------------------------------------------
 		"sip_route_uri=" + p.EdgeSIPRoute,
 
+		// -------------------------------------------------------------------
+		// AND THE SAME NEXT HOP FOR EVERY LEG THIS CALL BRIDGES TO.
+		//
+		// sip_route_uri above applies to THIS leg — the one to the carrier.
+		// When the customer answers, the controller bridges this channel to
+		// LiveKit (or later to a human), and that new leg needs the same next
+		// hop. On an inbound call the dialplan's `export nolocal:` provides
+		// it; an originate runs no dialplan, so nothing did.
+		//
+		// export_vars copies the named variables onto every leg bridged from
+		// this channel. Without it the LiveKit leg has no route, FreeSWITCH
+		// tries to resolve the placeholder host itself, and fails locally:
+		//
+		//   New Channel sofia/internal/<room>@livekit.invalid
+		//   entering state [terminated][503]   ← no INVITE ever leaves the box
+		//
+		// Observed in beta on the first outbound call: the customer answered
+		// and was hung up on ~200ms later, every time.
+		// -------------------------------------------------------------------
+		"export_vars=sip_route_uri",
+
+		// -------------------------------------------------------------------
+		// AND THE DIALPLAN A TRANSFER LANDS IN.
+		//
+		// When the agent asks for a human, livekit-sip sends a REFER and
+		// FreeSWITCH transfers THIS channel to `handoff` — in the channel's
+		// own context. An inbound call has one (`public`, from the sofia
+		// profile), where the catch-all hands it back to the controller. An
+		// originate never entered a context, so FreeSWITCH falls back to
+		// `default`, which has no dialplan:
+		//
+		//   Transfer sofia/internal/<customer>@<trunk> to XML[handoff@default]
+		//   Hangup ... [CS_ROUTING] [NORMAL_TEMPORARY_FAILURE]
+		//
+		// Observed in beta on the first outbound transfer: the agent said it
+		// was connecting the customer, and the customer was hung up on.
+		// -------------------------------------------------------------------
+		"force_transfer_context=" + TransferContext,
+
 		"origination_uuid=" + p.CallUUID,
 		"origination_caller_id_number=" + p.FromDID,
 
@@ -119,7 +172,7 @@ func Originate(p OriginateParams) (string, error) {
 		// own — which it is not.
 		"intron_direction=outbound",
 		"intron_tenant=" + p.TenantID,
-		"intron_plan=" + p.PlanID,
+		"intron_traffic_config=" + strconv.FormatInt(p.TrafficConfigID, 10),
 
 		"sip_h_X-Intron-Egress=" + EgressCarrier,
 		"sip_h_X-Intron-Tenant=" + p.TenantID,
@@ -135,7 +188,33 @@ func Originate(p OriginateParams) (string, error) {
 		clean = append(clean, sanitiseVar(v))
 	}
 
-	return fmt.Sprintf("{%s}sofia/internal/sip:%s@%s &socket(%s async full)",
+	// The port goes in the Request-URI, not in sip_route_uri. The next hop is
+	// always Kamailio on its own port; the Request-URI is what Kamailio relays
+	// to, so that is where the carrier's port has to be. Dropping it sends
+	// the INVITE to 5060 on the carrier's host, which a carrier listening
+	// elsewhere never sees — silently, because nothing refuses it.
+	host := p.TrunkHost
+	if p.TrunkPort != 0 && p.TrunkPort != 5060 {
+		host = fmt.Sprintf("%s:%d", p.TrunkHost, p.TrunkPort)
+	}
+
+	// THE APPLICATION IS QUOTED, AND IT HAS TO BE.
+	//
+	// `originate` splits its arguments on spaces, so an unquoted
+	// `&socket(host:port async full)` reaches FreeSWITCH as three arguments:
+	// the application gets `host:port` alone, and `async` and `full)` are read
+	// as the dialplan and context. The socket then runs SYNCHRONOUS:
+	//
+	//   EXECUTE ... socket(esl.beta.intron.internal:8022)   ← no async, no full
+	//
+	// On a synchronous socket `execute bridge` replies only when the bridge
+	// ENDS. The controller timed out waiting, called the bridge failed, and
+	// sent a hangup — which queued behind the bridge for the whole
+	// conversation and then hung the customer up the moment a transfer ended
+	// the bridge. Every outbound call had this; the transfer was only where it
+	// became audible. The inbound dialplan's socket was never affected: an XML
+	// action's data is one argument, spaces and all.
+	return fmt.Sprintf("{%s}sofia/internal/sip:%s@%s '&socket(%s async full)'",
 		strings.Join(clean, ","),
-		p.ToNumber, p.TrunkHost, p.CallbackTarget), nil
+		p.ToNumber, host, p.CallbackTarget), nil
 }

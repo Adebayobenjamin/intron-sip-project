@@ -2,7 +2,6 @@ package ctrl
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -15,26 +14,29 @@ import (
 
 // Routes is the routing config the store provides.
 type Routes interface {
-	HandoffTargets(ctx context.Context, tenantID string) ([]route.HandoffTarget, error)
-	AgentConfig(ctx context.Context, planID string) (route.AgentConfig, error)
+	// HandoffTargets returns the line's overrides, or the tenant's defaults,
+	// with the CALL'S trunk for an E.164 target to leave by.
+	HandoffTargets(ctx context.Context, tenantID string, trafficConfigID, trunkID int64) ([]route.HandoffTarget, error)
 
-	// PlanByID is for an OUTBOUND call, which has no dialled DID to resolve —
-	// the plan is named by the originate rather than found from a number.
-	PlanByID(ctx context.Context, planID string) (route.Plan, error)
+	// TrafficConfigByID is for an OUTBOUND call, which has no dialled number
+	// of ours to resolve — the line is named by the originate rather than
+	// found from a number.
+	TrafficConfigByID(ctx context.Context, id int64) (route.Line, error)
 }
 
-// connect answers an admitted call and bridges it to where the plan says.
+// connect answers an admitted call and bridges it to where the line says.
 //
 // # Order, and why it is this order
 //
-//  1. Build the dial string. If the plan cannot be routed — no agent config, no
-//     handoff target — the call must be refused BEFORE it is answered.
+//  1. Build the dial string. If the line cannot be routed — no handoff target,
+//     no trunk for an E.164 one — the call must be refused BEFORE it is answered.
 //     Answering first would start carrier billing on a call about to fail, and
 //     make the failure look to the caller like a connection that died.
 //  2. Answer.
-//  3. Start recording. After answer, because there is no media to record
-//     before it, and before the bridge so the whole conversation is captured
-//     rather than everything after the far end picked up.
+//  3. Start or stop recording, as recordingActionFor decides. After answer,
+//     because there is no media to record before it, and before the bridge so
+//     the whole conversation is captured — or, on a handoff, so none of the
+//     human half is.
 //  4. Bridge.
 //
 // Returns whether THIS SERVICE hung the call up. That matters for the record:
@@ -48,19 +50,19 @@ func (l *Listener) connect(
 	rec *calls.Record,
 	ch esl.ChannelData,
 	verdict admission.Verdict,
+	recording recordingAction,
 	watcher *hangupWatcher,
 ) (platformHungUp bool) {
 	params := route.Params{
 		CallUUID: ch.UUID,
 		TenantID: verdict.TenantID,
-		PlanID:   verdict.PlanID,
 		CallerID: ch.Caller,
 		DID:      rec.DID,
 	}
 
 	dial, err := l.dialString(ctx, log, rec, params, verdict)
 	if err != nil {
-		// Refused pre-answer, deliberately. A plan that cannot be routed is
+		// Refused pre-answer, deliberately. A line that cannot be routed is
 		// our misconfiguration, so the carrier gets a temporary failure rather
 		// than a rejection: the number is valid and will work once someone
 		// finishes setting it up.
@@ -92,8 +94,11 @@ func (l *Listener) connect(
 		log.Warn("could not record the answer", "error", err)
 	}
 
-	if verdict.Recording {
+	switch recording {
+	case recordingStart:
 		l.startRecording(conn, log, rec, ch.UUID, verdict.TenantID)
+	case recordingStop:
+		l.stopRecording(conn, log, ch.UUID, verdict.TenantID)
 	}
 
 	log.Info("bridging", "destination", string(verdict.Destination))
@@ -176,24 +181,17 @@ func (l *Listener) dialString(
 ) (string, error) {
 	switch verdict.Destination {
 	case admission.DestinationAI:
-		cfg, err := l.routes.AgentConfig(ctx, verdict.PlanID)
-		if err != nil {
-			if errors.Is(err, route.ErrNoAgentConfig) {
-				return "", fmt.Errorf("plan %s routes to the AI leg with no agent configured", verdict.PlanID)
-			}
-			return "", err
-		}
-
-		dial, err := route.LiveKit(params, cfg)
+		dial, err := route.LiveKit(params)
 		if err != nil {
 			return "", err
 		}
 
-		rec.LiveKitRoom = route.RoomName(cfg.RoomTemplate, params)
+		rec.LiveKitRoom = params.CallUUID
 		return dial, nil
 
 	case admission.DestinationHandoff:
-		targets, err := l.routes.HandoffTargets(ctx, verdict.TenantID)
+		targets, err := l.routes.HandoffTargets(ctx,
+			verdict.TenantID, verdict.TrafficConfigID, verdict.TrunkID)
 		if err != nil {
 			return "", err
 		}
@@ -211,37 +209,7 @@ func (l *Listener) dialString(
 		return dial, nil
 
 	default:
-		return "", fmt.Errorf("plan %s has destination %q, which cannot be routed",
-			verdict.PlanID, verdict.Destination)
+		return "", fmt.Errorf("traffic config %d has destination %q, which cannot be routed",
+			verdict.TrafficConfigID, verdict.Destination)
 	}
-}
-
-// startRecording writes the call to disk on the FreeSWITCH node.
-//
-// Failure is NOT fatal to the call. A conversation that happens without being
-// recorded is worth a loud log line; refusing to connect a caller because a
-// disk is full is not a trade anyone would choose.
-//
-// RECORD_STEREO puts each leg on its own channel, which is what makes a
-// recording useful afterwards — a mixed-down mono file cannot be separated
-// back into who said what.
-func (l *Listener) startRecording(conn *esl.Conn, log *slog.Logger, rec *calls.Record, uuid, tenantID string) {
-	path := route.RecordingPath(l.cfg.RecordingPath, tenantID, uuid)
-
-	if err := conn.SetVar(uuid, "RECORD_STEREO", "true"); err != nil {
-		log.Warn("could not set stereo recording", "error", err)
-	}
-
-	if _, err := conn.Execute(uuid, "record_session", path); err != nil {
-		log.Error("recording failed to start; the call continues unrecorded",
-			"path", path, "error", err)
-		return
-	}
-
-	// Recorded even though nothing ships the file yet: the uploader is not
-	// deployed and recording_bucket is empty. The path is the contract between
-	// FreeSWITCH, the eventual uploader and this record, and fixing it now is
-	// cheaper than reconciling three systems later.
-	rec.RecordingURL = path
-	log.Info("recording started", "path", path)
 }

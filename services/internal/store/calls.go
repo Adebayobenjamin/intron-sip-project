@@ -63,13 +63,14 @@ func (p *Pool) ClaimCall(ctx context.Context, c calls.Claim) error {
 	err = tx.QueryRow(ctx, claimCallSQL,
 		c.UUID,
 		c.TenantID,
-		nullStringArg(c.PlanID),
+		nullInt64Arg(c.TrafficConfigID),
 		nullInt64Arg(c.TrunkID),
 		c.Direction,
 		nullStringArg(c.DID),
 		nullStringArg(c.Caller),
 		nullStringArg(c.Callee),
 		nullStringArg(c.Node),
+		recordingModeArg(c.RecordingMode),
 	).Scan(&claimed)
 
 	switch {
@@ -89,10 +90,10 @@ func (p *Pool) ClaimCall(ctx context.Context, c calls.Claim) error {
 
 const claimCallSQL = `
 INSERT INTO calls (
-    call_uuid, tenant_id, plan_id, trunk_id,
-    direction, did, caller, callee, node, state
+    call_uuid, tenant_id, traffic_config_id, trunk_id,
+    direction, did, caller, callee, node, recording_mode, state
 )
-SELECT $1, t.id, $3, $4, $5, $6, $7, $8, $9, 'ringing'
+SELECT $1, t.id, $3, $4, $5, $6, $7, $8, $9, $10, 'ringing'
 FROM tenants t
 WHERE t.id = $2
   AND t.deleted_at IS NULL
@@ -198,17 +199,17 @@ const insertHistorySQL = `
 INSERT INTO call_history (
     call_uuid, sip_call_id, tenant_id, direction,
     did, caller, callee,
-    trunk_id, plan_id, handoff_target_id, livekit_room, node,
+    trunk_id, traffic_config_id, handoff_target_id, livekit_room, recording_mode, node,
     invite_at, ring_at, answer_at, end_at,
     ring_seconds, talk_seconds, total_seconds,
     sip_code, hangup_cause, hangup_by, outcome, recording_url
 ) VALUES (
     $1, $2, $3, $4,
     $5, $6, $7,
-    $8, $9, $10, $11, $12,
-    $13, $14, $15, $16,
-    $17, $18, $19,
-    $20, $21, $22, $23, $24
+    $8, $9, $10, $11, $12, $13,
+    $14, $15, $16, $17,
+    $18, $19, $20,
+    $21, $22, $23, $24, $25
 )
 ON CONFLICT (call_uuid) DO UPDATE SET
     -- The beginning: earliest wins, and never overwritten with NULL.
@@ -247,6 +248,9 @@ ON CONFLICT (call_uuid) DO UPDATE SET
     handoff_target_id = COALESCE(EXCLUDED.handoff_target_id, call_history.handoff_target_id),
     livekit_room      = COALESCE(EXCLUDED.livekit_room, call_history.livekit_room),
     recording_url     = COALESCE(EXCLUDED.recording_url, call_history.recording_url),
+    -- Both legs of a transferred call carry the same snapshot, so this only
+    -- ever fills a gap.
+    recording_mode    = COALESCE(call_history.recording_mode, EXCLUDED.recording_mode),
     callee            = COALESCE(EXCLUDED.callee, call_history.callee),
 
     -- Recomputed from the merged timestamps. The first write's talk_seconds
@@ -331,14 +335,11 @@ func nullTimeArg(t time.Time) any {
 // resolved from the number, which is the only way round the fact that the
 // number carries no tenant at all.
 //
-// Same columns as LiveCalls above, deliberately: one shape for a call in
-// progress, whether it is being listed for an operator or read by the leg that
-// continues it.
+// Same columns as LiveCalls, deliberately: one shape for a call in progress,
+// whether it is being listed for an operator or read by the leg that continues
+// it — which needs the line, the trunk and the recording snapshot from it.
 const liveCallSQL = `
-SELECT call_uuid, tenant_id, COALESCE(plan_id, ''), direction,
-       COALESCE(did, ''), COALESCE(caller, ''), state,
-       COALESCE(node, ''), COALESCE(livekit_room, ''),
-       started_at, answered_at, heartbeat_at
+SELECT ` + liveColumns + `
   FROM calls
  WHERE call_uuid = $1`
 
@@ -351,11 +352,7 @@ SELECT call_uuid, tenant_id, COALESCE(plan_id, ''), direction,
 func (p *Pool) LiveCall(ctx context.Context, uuid string) (calls.Live, error) {
 	var l calls.Live
 
-	err := p.QueryRow(ctx, liveCallSQL, uuid).Scan(
-		&l.CallUUID, &l.TenantID, &l.PlanID, &l.Direction,
-		&l.DID, &l.Caller, &l.State,
-		&l.Node, &l.LiveKitRoom,
-		&l.StartedAt, &l.AnsweredAt, &l.HeartbeatAt)
+	err := scanLive(p.QueryRow(ctx, liveCallSQL, uuid), &l)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return calls.Live{}, calls.ErrNoLiveCall
 	}
@@ -364,4 +361,29 @@ func (p *Pool) LiveCall(ctx context.Context, uuid string) (calls.Live, error) {
 	}
 
 	return l, nil
+}
+
+// liveColumns is the one shape of a call in progress.
+const liveColumns = `
+       call_uuid, tenant_id, COALESCE(traffic_config_id, 0), COALESCE(trunk_id, 0),
+       direction, COALESCE(did, ''), COALESCE(caller, ''), state, recording_mode,
+       COALESCE(node, ''), COALESCE(livekit_room, ''),
+       started_at, answered_at, heartbeat_at`
+
+func scanLive(row interface{ Scan(...any) error }, l *calls.Live) error {
+	return row.Scan(
+		&l.CallUUID, &l.TenantID, &l.TrafficConfigID, &l.TrunkID,
+		&l.Direction, &l.DID, &l.Caller, &l.State, &l.RecordingMode,
+		&l.Node, &l.LiveKitRoom,
+		&l.StartedAt, &l.AnsweredAt, &l.HeartbeatAt)
+}
+
+// recordingModeArg defaults an unset mode to none rather than passing an empty
+// string the column's check would refuse. A claim with no mode is a call with
+// no line to say otherwise.
+func recordingModeArg(m string) string {
+	if m == "" {
+		return "none"
+	}
+	return m
 }

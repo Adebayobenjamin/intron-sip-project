@@ -1,13 +1,13 @@
 variable "aws_region" {
   type        = string
-  description = "See stacks/network/beta/variables.tf for why eu-central-1 and not af-south-1."
-  default     = "eu-central-1"
+  description = "See stacks/network/beta/variables.tf for why eu-west-1 and not af-south-1."
+  default     = "eu-west-1"
 }
 
 variable "state_bucket" {
   type        = string
   description = "State bucket, created by the tfstate stack. Read here to configure the remote_state lookups for network, secrets-manager and sip-core."
-  default     = "intron-sip-tfstate-eu-central-1"
+  default     = "intron-sip-tfstate-eu-west-1"
 }
 
 variable "aws_profile" {
@@ -28,5 +28,5 @@ variable "aws_profile" {
                            source configures its own backend and inherits
                            NOTHING from the provider block.
   DESC
-  default     = "klarity_aws"
+  default     = "intron_aws"
 }

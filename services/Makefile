@@ -9,9 +9,9 @@ SHELL := /bin/bash
 
 SERVICES    := control-plane esl-controller
 
-AWS_PROFILE ?= klarity_aws
-AWS_REGION  ?= eu-central-1
-AWS_ACCOUNT ?= 023585529698
+AWS_PROFILE ?= intron_aws
+AWS_REGION  ?= eu-west-1
+AWS_ACCOUNT ?= 261326853223
 ECR_REGISTRY := $(AWS_ACCOUNT).dkr.ecr.$(AWS_REGION).amazonaws.com
 
 # TAG names exactly one set of bytes, forever: the ECR repositories are created

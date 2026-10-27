@@ -11,7 +11,7 @@ where a number appears here it is quoted from there rather than chosen.
 ```
                                   control-plane :8080 ──▶ RDS Postgres
                                         ▲   │
-                DID resolution, plan     │   │ originate (loopback)
+              number resolution, line    │   │ originate (loopback)
                 config, CDRs, live calls │   ▼
 FreeSWITCH ──socket() per call──▶ esl-controller :8022 ──▶ LiveKit (own VPC)
      ▲                                  │
@@ -37,7 +37,7 @@ first, and most of them fail silently if the application disagrees.
 | Both containers on **one** host, `--network host` | `roles/app-service/templates/app-service.service.j2` | No port may be claimed twice. The controller sees the real source address of each FreeSWITCH connection — that is deliberate and load-bearing. |
 | Config arrives as an **env file, already rendered** | `roles/app-service/templates/service.env.tpl.j2` | The apps read `os.Getenv` and nothing else. No Secrets Manager SDK, no AWS call to start. |
 | `esl-controller` has no `DATABASE_URL` | **changed** — it gets one, see [Why the split is where it is](#why-the-split-is-where-it-is) | Add `DATABASE_URL` to the `esl-controller` secret container and its env block. The controller reads and writes Postgres directly; it does not depend on the API to carry a call. |
-| Kamailio makes no HTTP call on the inbound path | **changed** — `route[ADMISSION]` is removed, see [Contract 1](#kamailio-does-not-ask--and-that-is-the-change) | The DID lookup happens in the controller, with the call already in hand. Caching is still the availability model, just no longer the edge's. |
+| Kamailio makes no HTTP call on the inbound path | **changed** — `route[ADMISSION]` is removed, see [Contract 1](#kamailio-does-not-ask--and-that-is-the-change) | The number lookup happens in the controller, with the call already in hand. Caching is still the availability model, just no longer the edge's. |
 | FreeSWITCH hands the call over **pre-answer** | `roles/freeswitch/templates/dialplan-public.xml.j2` | The controller owns answer/reject. A rejection must carry a cause code, not a silent hangup. |
 | Postgres, and nothing else | `iac/stacks/` | No Redis, no Temporal, no ClickHouse. Everything the reference platform does with those has to be Postgres, in-process, or explicitly deferred. |
 | Debian on `m6i.large` / `c6i.xlarge` | `iac/stacks/control-plane`, `sip-core` | Images are **linux/amd64**. A laptop build on Apple silicon produces arm64 images that pull fine and then exit 255 with `exec format error`. |
@@ -64,8 +64,8 @@ point of giving it a database credential, and it buys three things:
   every deploy. A design where the controller asks it a question per call makes
   every API restart a window where inbound calls fail, on the service that was
   specifically built to restart freely.
-- **One fewer hop in the call-setup path.** The DID lookup is a point query on
-  an indexed column, not an HTTP round trip that wraps a point query.
+- **One fewer hop in the call-setup path.** The number lookup is an indexed
+  range-containment query, not an HTTP round trip that wraps one.
 - **CDR writes are a transaction, not a delivery problem.** Writing through
   another service's API needs an outbox, retries and idempotency keys to
   survive a restart. Writing to Postgres needs a transaction.
@@ -79,7 +79,7 @@ directly and `core-api` is purely the configuration plane.
 |---|---|
 | Two services, one schema | `control-plane` is the **only** migrator. The controller never runs migrations — two processes racing at startup is a deploy-ordering problem you do not want at 3am. |
 | Two connection pools on a `db.t4g.micro` | 1 GiB of RAM is roughly 110 connections. Both pools plus operator sessions must fit — cap them explicitly rather than taking a driver default. |
-| Two caches, two TTLs | Accept it. An operator edit takes up to one TTL to reach each process, which for DID-to-tenant config is fine. |
+| Two caches, two TTLs | Accept it. An operator edit takes up to one TTL to reach each process, which for number-to-line config is fine. |
 
 That last one is not optional, and the repo says so: the `instance_class`
 variable notes that `db.t4g.micro` "stops being defensible if the API does not
@@ -91,24 +91,31 @@ cache.
 
 Configuration and actions. Nothing on this list is in the path of a call.
 
-**Config — CRUD, JWT-authenticated, tenant-scoped**
+**Config — CRUD, API-key authenticated, tenant-scoped**
 
-`/v1/tenants`, `/v1/dids`, `/v1/trunks`, `/v1/plans`, `/v1/handoff-targets`,
-`/v1/agent-configs`, `/v1/business-hours`, `/v1/api-keys`
+`/v1/tenants`, `/v1/trunks`, `/v1/traffic-configs`, `/v1/handoff-targets`,
+`/v1/api-keys`
+
+There is no DID resource and no plan resource. A trunk carries its numbers as
+blocks (`did_ranges`), and a **traffic config** — a line — says what happens to
+a subset of them in one direction. There are no agent configs either: every
+call reaches the same agent, which LiveKit's dispatch rule summons by name. See
+[Data model](#data-model).
 
 **Actions — things that make something happen**
 
 | Endpoint | Does |
 |---|---|
 | `POST /v1/originate` | Queues an outbound call — [Contract 3](#contract-3--originate) |
-| `POST /v1/trunks/{id}/sync` | Reconciles a trunk against Twilio: numbers, origination URI, IP ACL |
 | `POST /v1/calls/{uuid}/hangup` | Operator kill switch for a call in progress |
 
 **Read models — for an operator or a dashboard**
 
 | Endpoint | Answers |
 |---|---|
-| `GET /v1/route?did=&from=` | "Would a call to this number be admitted right now, and why not?" Same code as the call path; see [Contract 1](#contract-1--admission) |
+| `GET /v1/route?did=` | "Would a call to this number be admitted right now, and why not?" Same code as the call path; see [Contract 1](#contract-1--admission) |
+| `GET /v1/numbers/{e164}` | "Which trunk carries this number, and which line handles it in each direction?" Includes the outbound side, which `/v1/route` never looks at |
+| `GET /v1/trunks/{id}/coverage` | How a trunk's numbers divide among lines, and which are not covered — the numbers that ring and are refused, or that nobody can dial out from |
 | `GET /v1/calls` | What is live right now, per tenant |
 | `GET /v1/call-history` | CDRs, filtered and paginated |
 
@@ -132,7 +139,8 @@ services/
     esl-controller/             main.go, wire.go, app.go
   internal/
     store/                      repositories — the SQL both binaries share
-    admission/                  DID -> tenant/plan, the cache, serve-stale
+    admission/                  number -> trunk/line/tenant, the cache, serve-stale
+    numrange/                   E.164 blocks <-> int8 ranges
     calls/                      live-call ledger + CDR writes
     controlplane/
       handlers/ services/ requests/ router/ middleware/
@@ -146,7 +154,7 @@ services/
 ```
 
 **`internal/store` is the shared layer, and it is shared deliberately.** Both
-binaries read the same tables, and two hand-written copies of "resolve a DID"
+binaries read the same tables, and two hand-written copies of "resolve a number"
 drift — one gets the soft-delete filter and the other does not, and the
 difference shows up as a call routed to a tenant that was removed last week.
 One package, two callers.
@@ -162,8 +170,8 @@ per domain in each layer.
 
 ## Contract 1 — admission
 
-Resolve a dialled number to a tenant and a plan, and decide whether the call
-lives. **This is a package (`internal/admission`), not an endpoint.** The
+Resolve a dialled number to its trunk, its inbound line and its tenant, and
+decide whether the call lives. **This is a package (`internal/admission`), not an endpoint.** The
 controller calls it in-process, against the database, with the call already in
 hand.
 
@@ -223,10 +231,10 @@ both are now impossible rather than merely handled.
 **The perimeter does not weaken.** What kept the internet out was never this
 lookup — it is `carrier_sip_cidrs` on the edge security group
 (`sip-core/_main/security-groups.tf:54`), which admits 5060 from carrier ranges
-and nothing else. The DID check is a business rule, not a security boundary,
-and it belongs where the business logic is.
+and nothing else. The ownership check is a business rule, not a security
+boundary, and it belongs where the business logic is.
 
-**What it costs.** A call to a DID we do not own now reaches FreeSWITCH,
+**What it costs.** A call to a number we do not own now reaches FreeSWITCH,
 allocates a session and opens a TCP socket before being rejected, instead of
 dying at the edge. That is real work per junk call — but only from an IP a
 carrier trunk is allowed to originate from, so the volume is bounded by the
@@ -236,19 +244,33 @@ trunk, not by the internet.
 
 ```go
 type Verdict struct {
-    Admitted    bool
-    TenantID    string
-    PlanID      string
-    Destination string   // ai | handoff | reject
-    Recording   bool
-    Reason      string   // ok, unknown_did, tenant_suspended,
-                         // out_of_hours, over_capacity
+    Admitted        bool
+    Reason          Reason        // see below
+    TenantID        string
+    TrafficConfigID int64         // the inbound line
+    Destination     Destination   // ai | handoff | reject
+    RecordingMode   RecordingMode // none | ai_only | full — snapshotted onto the call
+    TrunkID         int64         // the trunk carrying the number; E.164 handoffs leave by it
+    Stale           bool          // answered from an expired cache entry
 }
 ```
 
-It returns **the whole plan**, not two opaque ids. The controller needs the
-plan config regardless, and resolving it in the same pass as the DID is one
-query rather than two. When this had to squeeze through Kamailio's
+One query answers it:
+
+```
+number ─▶ trunks.did_ranges @> number            no trunk     → unknown_did        404
+            └─▶ traffic_configs (inbound) @> it   no line      → no_traffic_config  503
+                  └─▶ tenant: the line's, or      suspended    → tenant_suspended   403
+                      the trunk's on BYOT         inactive     → traffic_config_inactive  403
+                                                  reject       → traffic_config_rejects   403
+```
+
+The schema guarantees at most one trunk and one inbound line per number (see
+[Data model](#data-model)), so there is never a choice between candidates.
+
+It returns **the whole line**, not two opaque ids. The controller needs its
+configuration regardless, and resolving it in the same pass as the number is
+one query rather than two. When this had to squeeze through Kamailio's
 `jansson_get` that was not an option; now it is a struct.
 
 `Reason` is for logs and the operator endpoint. `Admitted == false` always
@@ -276,10 +298,10 @@ that is fine: the staleness budget is the TTL either way, and an operator edit
 reaching one process a few seconds before the other changes nothing anyone can
 observe.
 
-The cache is in-process, keyed by normalised DID, TTL on the order of a minute.
-Two rules that matter more than the TTL:
+The cache is in-process, keyed by normalised number, TTL on the order of a
+minute. Two rules that matter more than the TTL:
 
-**Serve stale on database error.** A DID→tenant mapping is operator-edited
+**Serve stale on database error.** A number→line mapping is operator-edited
 config; it changes on the order of days. If Postgres is unreachable and the
 cache holds an entry, answer from it and log loudly. Single-AZ RDS still sits
 behind every inbound call (`docs/ROLLOUT.md`, Stage 4); this is what turns a
@@ -287,12 +309,12 @@ database blip into stale-but-working. Moving the lookup off Kamailio made the
 blast radius one call instead of the whole edge — it did not make the cache
 optional.
 
-**Cache the schedule, not the verdict.** Business hours are a static row, but
-whether a plan is open depends on the clock. Cache the row and evaluate
-openness fresh on every call, or a plan stays shut for up to a TTL after it
-opened.
+There are no business hours. A line is open whenever its status is active; if
+schedules are added later, cache the schedule row and evaluate openness fresh
+on every call, or a line stays shut for up to a TTL after it opened.
 
-Warm the cache at startup. A cold process after a deploy otherwise takes its
+Warm the cache at startup — the numbers of small inbound blocks are enumerated;
+a large block resolves on demand rather than being materialised. A cold process after a deploy otherwise takes its
 first few hundred calls at database latency, and fails them all if Postgres
 happens to be the thing that was wrong.
 
@@ -335,7 +357,7 @@ the controller had no database credential, and that constraint is gone.
 
 | Moment | What the controller writes |
 |---|---|
-| Socket accepted, DID resolved | `INSERT INTO calls` — claims the concurrency slot |
+| Socket accepted, number resolved | `INSERT INTO calls` — claims the concurrency slot |
 | Answer, bridge, handoff | `UPDATE calls` — state and timestamps |
 | Every 30s while the call runs | `UPDATE calls SET heartbeat_at = now()` |
 | Hangup | `INSERT INTO call_history`, `DELETE FROM calls`, **one transaction** |
@@ -385,50 +407,61 @@ FreeSWITCH, on the connection it already holds.
 
 ```
 POST /v1/originate            (operator -> control-plane :8080)
-{ "tenant_id", "to", "from", "plan_id", "metadata" }
-→ 202 { "call_uuid" }
+{ "tenant_id", "to", "from" }
+→ 202 { "call_uuid", "traffic_config_id", ... }
 
-control-plane resolves the from-DID, queues an originate_requests row
+control-plane finds the from-number's outbound line, claims a slot,
+queues an originate_requests row
       │
       ▼  claimed via FOR UPDATE SKIP LOCKED
 esl-controller
       │  bgapi originate {origination_uuid=<uuid>,
-      │                   origination_caller_id_number=<the DID>,
+      │                   origination_caller_id_number=<from>,
+      │                   intron_traffic_config=<line id>,
       │                   sip_route_uri=sip:<kamailio>:5060, ...}
       │           sofia/internal/sip:<to>@<trunk host>
       ▼  inbound ESL, FS:8021 — already open, already credentialled
 FreeSWITCH ──INVITE──▶ Kamailio ──▶ carrier
 ```
 
-### The from-DID is resolved before the call is placed
+### The from-number is resolved before the call is placed
 
-`from` names the DID the call presents. It is not a hint and it is not taken on
-trust — the control plane looks it up in `dids` and refuses the originate
-unless the row is **active and owned by `tenant_id`**. Without that check,
-whoever can call the API can present any number on the platform, including
-another tenant's, and caller-ID validation that trusts its caller is not
-validation.
+`from` names the number the call presents. It is not a hint and it is not taken
+on trust — the control plane refuses the originate (`403`) unless `from` lies
+inside an **active outbound traffic config belonging to `tenant_id`**. Without
+that check, whoever can call the API can present any number on the platform,
+including another tenant's, and caller-ID validation that trusts its caller is
+not validation.
 
-**One lookup settles two things.** A `dids` row carries both the tenant and the
-trunk, so resolving the from-DID also resolves the route out:
+There is no `plan_id` in the request. The line is **found from the number**, so
+a caller cannot pick a line that does not own the number it presents.
+
+**One lookup settles everything the call needs:**
 
 ```
-from = +4930123456
-   └─▶ dids row ─┬─▶ owned by t_9f3a?        → authorisation
-                 ├─▶ becomes the From header → caller ID
-                 └─▶ trunk_id → trunks row   → SIP host for the Request-URI
+from = +2348000000185
+   └─▶ outbound line ─┬─▶ owned by beta?          → authorisation
+                      ├─▶ becomes the From header → caller ID
+                      ├─▶ trunk_id → trunks row   → SIP host for the Request-URI
+                      ├─▶ destination             → what the answered customer reaches
+                      └─▶ recording_mode          → snapshotted onto the slot now
 ```
 
 That coupling is not incidental, it is required. Carriers verify the calling
 number belongs to the account the call arrives on — Twilio rejects an Elastic
 SIP Trunking call whose `From` is not a number on the account. Presenting
-tenant A's DID over a trunk that does not carry it is a `403` at best and a
+tenant A's number over a trunk that does not carry it is a `403` at best and a
 call that completes with an unroutable caller ID at worst. Deriving the trunk
-*from the DID* makes the mismatch unrepresentable rather than merely unlikely.
+*from the line* makes the mismatch unrepresentable rather than merely unlikely.
 
-If `from` is omitted, fall back to the plan's default DID, then the tenant's.
-Never fall back to a platform-wide number: it works, which is the problem — see
+`from` is required. There is no fallback to a default number: a platform-wide
+caller ID works, which is the problem — see
 [Things that will fail silently](#things-that-will-fail-silently).
+
+The slot is claimed **at queue time**, with the line's recording mode
+snapshotted onto it: the call starts when it is asked for, so the policy in
+force then governs it. The controller reads the snapshot back when the far end
+answers, and does not claim a second slot.
 
 Kamailio stays in the **signalling** path — the INVITE still leaves through it,
 RTPEngine still anchors the media, the Elastic IP is still what the carrier
@@ -490,7 +523,7 @@ holds ESL connections, so the API cannot place a call itself. With a shared
 database the handoff is a table, not a call:
 
 ```
-POST /v1/originate ─▶ control-plane validates the from-DID,
+POST /v1/originate ─▶ control-plane resolves the from-number's line,
                       INSERT INTO originate_requests (status='pending')
                                     │
                       controller claims it:
@@ -540,10 +573,11 @@ Per call, in order:
    and you get the initial `CHANNEL_DATA` and then silence forever, including
    no `CHANNEL_HANGUP`.
 3. Read the call context off the channel: `uuid`, `destination_number`,
-   caller ID, `intron_node`. The tenant and plan are **not** here any more —
-   Kamailio no longer looks them up, so `X-Intron-Tenant` / `X-Intron-Plan` and
-   the `intron_tenant` / `intron_plan` channel variables are gone.
-4. `admission.Resolve(did, from)` — in-process, cache first, Postgres behind
+   caller ID, `intron_node`. The tenant and line are **not** here for an inbound
+   call — Kamailio no longer looks them up. An answered **outbound** call
+   carries `intron_direction`, `intron_tenant` and `intron_traffic_config`,
+   set by the originate this service built.
+4. `admission.Resolve(did)` — in-process, cache first, Postgres behind
    it. Not admitted → hang up `UNALLOCATED_NUMBER`, which the carrier sees as a
    SIP `404`. No answer within 2s → `NORMAL_TEMPORARY_FAILURE`.
 5. Claim the concurrency slot with the conditional insert in
@@ -555,17 +589,32 @@ Per call, in order:
    a rejection look to the caller like a call that connected and died. Every
    rejection above happens **pre-answer**, which is the whole reason that
    ordering matters.
-8. Recording, if the plan says so: `record_session` to `/mnt/recordings`, with
-   the filename fixed now (`<tenant>__<call_uuid>.wav`) even though
-   `recording_bucket` is empty and the uploader is not deployed. The naming is
-   the contract between FreeSWITCH, the eventual uploader, and the CDR's
-   `recording_url` — changing it later means two systems to fix.
+8. Recording, per the line's `recording_mode` — `full`, or `ai_only` on a
+   line whose destination is `ai` (a line going straight to a human has no AI
+   half to record): `record_session` to
+   `/mnt/recordings`, with the filename fixed now
+   (`<tenant>__<call_uuid>.wav`) even though `recording_bucket` is empty and
+   the uploader is not deployed. The naming is the contract between
+   FreeSWITCH, the eventual uploader, and the CDR's `recording_url` —
+   changing it later means two systems to fix.
+
+   `ai_only` STOPS at handoff, and stopping has to be explicit: the recording
+   is a media bug on the caller's channel, and a REFER moves that same channel
+   back into the dialplan, so the bug goes with it. The transferred leg issues
+   `stop_record_session` on the same path before bridging the human. Under
+   `full` it does nothing, and the recording carries on.
+
+   The mode is snapshotted onto the `calls` row at the claim rather than
+   re-read when the transferred leg arrives, so an operator editing the line
+   mid-call cannot change the policy of a conversation already in progress.
 9. Bridge the B-leg to `livekit-sip` through Kamailio. **A `sips:` URI when
    `livekit_sip_transport` is `tls`** — the scheme selects TLS, not the port. A
    `sip:` URI aimed at 5061 is dropped by the far end and surfaces as "no
    route", naming nothing about TLS.
-10. Handoff, on request: bridge the caller out to the tenant's handoff target,
-    in order, with failover.
+10. Handoff, on request: bridge the caller out to the line's handoff
+    overrides, or the tenant's defaults if it has none, in order, with
+    failover. An E.164 target leaves by the **call's** trunk, read from the
+    `calls` row.
 11. `CHANNEL_HANGUP` → one transaction: insert `call_history`, delete the
     `calls` row, commit. Then close the socket.
 
@@ -574,8 +623,9 @@ and the CDR ever see:
 
 | Situation | Cause | Carrier sees |
 |---|---|---|
-| Nobody owns this DID | `UNALLOCATED_NUMBER` | `404 Not Found` |
-| Tenant suspended, or plan closed | `CALL_REJECTED` | `403 Forbidden` |
+| No trunk carries this number | `UNALLOCATED_NUMBER` | `404 Not Found` |
+| Tenant suspended, line inactive, or line set to reject | `CALL_REJECTED` | `403 Forbidden` |
+| Ours, but no inbound line covers it | `NORMAL_TEMPORARY_FAILURE` | `503` |
 | Over the tenant's concurrency cap | `NORMAL_CIRCUIT_CONGESTION` | `503` |
 | Control plane unreachable | `NORMAL_TEMPORARY_FAILURE` | `503` |
 
@@ -611,16 +661,16 @@ the whole trick:
 ```
 {sip_route_uri=sip:10.70.0.10:5060,\
 origination_uuid=<uuid>,\
-origination_caller_id_number=+4930123456,\
-intron_tenant=t_9f3a,intron_direction=outbound,\
+origination_caller_id_number=+2348000000185,\
+intron_tenant=beta,intron_traffic_config=4,intron_direction=outbound,\
 sip_h_X-Intron-Egress=carrier}\
-sofia/internal/sip:+2348012345678@intron-beta.pstn.frankfurt.twilio.com
+sofia/internal/sip:+2348031234567@intron-beta.pstn.dublin.twilio.com
 ```
 
 `sip_route_uri` forces the next hop to Kamailio while leaving the URI pointed
 at the trunk's host. Both the caller ID and that hostname come from the same
-place — the from-DID resolved at originate time, and the trunk its `dids` row
-points at (see [Contract 3](#the-from-did-is-resolved-before-the-call-is-placed)).
+place — the outbound line the from-number resolved to at originate time, and
+its trunk (see [Contract 3](#the-from-number-is-resolved-before-the-call-is-placed)).
 So **Kamailio holds no carrier config at all**, consistent with trunking being
 application-layer.
 
@@ -634,8 +684,8 @@ with no `<gateways>` block, and it can stay that way: a profile plus a URI is a
 complete dial string. That is one fewer template to maintain and one fewer
 place for a carrier address to be written down.
 
-`origination_caller_id_number` must be set, and it must be a DID the tenant
-owns. It becomes the `From`, which is what the carrier bills, displays, and
+`origination_caller_id_number` must be set, and it must be a number inside one
+of the tenant's outbound lines. It becomes the `From`, which is what the carrier bills, displays, and
 screens on. Left unset it is FreeSWITCH's default and the carrier rejects the
 call or presents something meaningless.
 
@@ -718,8 +768,8 @@ range leaks until a restart.
 
 | Egress | `X-Intron-Egress` | Request-URI host | Selected by |
 |---|---|---|---|
-| Outbound call | `carrier` | SIP host of the from-DID's trunk | the application, via the `dids` row |
-| Human handoff | `carrier` | handoff target's host, or the tenant's trunk for an E.164 | the application |
+| Outbound call | `carrier` | SIP host of the outbound line's trunk | the application, via the line the from-number resolves to |
+| Human handoff | `carrier` | handoff target's host, or the **call's** trunk for an E.164 | the application |
 | LiveKit B-leg | `livekit` | placeholder — dispatcher overwrites it | `DS_LIVEKIT`, set 2 |
 
 One header, one branch, three call types. The alternative — inferring intent
@@ -734,7 +784,7 @@ The AI agent decides, mid-call, that the caller needs a human. It tells
 livekit-sip, which sends a **REFER** on the established B-leg. FreeSWITCH dials
 the referred destination, bridges the caller to it, and drops the agent's leg.
 
-Different from `destination: handoff`, which is decided from the plan *before
+Different from `destination: handoff`, which is decided from the line *before
 the call is answered* and never changes. Here the call starts on the AI leg and
 moves.
 
@@ -871,13 +921,9 @@ migrations" question entirely.
 | Table | Holds |
 |---|---|
 | `tenants` | id, name, status, concurrency cap |
-| `trunks` | carrier or BYOT SBC, SIP host/port, auth, source CIDRs, channel limit. See below — this is the one table with a settled shape |
-| `dids` | number (E.164), tenant, plan, trunk |
-| `did_ranges` | range-based allocation, for blocks bought at once |
-| `inbound_plans` | destination (`ai` \| `handoff` \| `reject`), recording on/off, business hours, out-of-hours behaviour |
-| `handoff_targets` | per tenant, ordered: SIP URI or E.164, hours, enabled |
-| `agent_configs` | LiveKit room policy, agent identity, metadata template, per plan |
-| `business_hours` | schedule rows, referenced by plans |
+| `trunks` | a carrier connection **and the numbers it carries** (`did_ranges`, an `int8multirange`). `tenant_id` NULL is the platform trunk; set is the client's own (BYOT). See below |
+| `traffic_configs` | a **line**: tenant, trunk, `direction` (`inbound` \| `outbound`), `did_ranges` within the trunk's, `destination` (`ai` \| `handoff` \| `reject`), `recording_mode` (`none` \| `ai_only` \| `full`), status, metadata |
+| `handoff_targets` | per tenant, ordered: SIP URI or E.164, enabled. `traffic_config_id` NULL is the tenant default; set is an override for that line |
 | `api_keys` | machine tokens, hashed, with a label so they can be rotated one at a time |
 | `calls` | live calls — the concurrency ledger, with heartbeat |
 | `call_history` | CDRs. Append-mostly |
@@ -885,11 +931,41 @@ migrations" question entirely.
 
 `call_history` columns worth fixing early because they are painful to
 backfill: `call_uuid`, `sip_call_id`, `tenant_id`, `direction`, `did`,
-`caller`, `callee`, `trunk_id`, `plan_id`, timestamps for invite/ring/answer/end,
-`sip_code`, `hangup_cause`, `hangup_by`, `outcome`, `handoff_target_id`,
-`livekit_room`, `recording_url`, `metadata jsonb`.
+`caller`, `callee`, `trunk_id`, `traffic_config_id`, `recording_mode`,
+timestamps for invite/ring/answer/end, `sip_code`, `hangup_cause`, `hangup_by`,
+`outcome`, `handoff_target_id`, `livekit_room`, `recording_url`,
+`metadata jsonb`.
 
-Every query carries `tenant_id`. Every cache key includes it.
+Every query carries `tenant_id`.
+
+### Numbers are ranges, and the database refuses overlaps
+
+A number is stored as the digits of its E.164 form in an `int8` range —
+`+2348000000100` is `2348000000100` — so containment is a GiST index lookup and
+an overlap is something Postgres can refuse. The API speaks inclusive E.164
+blocks, `{"from": "+2348000000100", "to": "+2348000000199"}`; storage is
+half-open. `internal/numrange` is the one place that converts, and it refuses a
+block whose ends differ in length (it would claim every number of the shorter
+length in between too) and a leading zero after the `+` (the numeric form would
+silently drop it).
+
+Six rules are enforced by the schema itself, because each is a race if left to
+application code — two requests checking "is this free?" at once both see yes:
+
+| Rule | Enforced by |
+|---|---|
+| A number is on one trunk only | exclusion constraint `trunks_numbers_no_overlap` |
+| No two lines claim a number in the same direction | exclusion constraint `traffic_configs_numbers_no_overlap` (needs `btree_gist`) |
+| A line's numbers lie within its trunk's | trigger `traffic_configs_check` |
+| A line on a BYOT trunk belongs to that trunk's tenant | trigger `traffic_configs_check` |
+| A trunk cannot shrink or be deleted under a line | trigger `trunks_check` |
+| A handoff override belongs to the line's tenant | trigger `handoff_targets_check` |
+
+The triggers raise SQLSTATE `IN001` with a message written for the API caller;
+the store maps it, and the named constraints, to **409** with that message.
+
+Soft-deleted rows do not count, so numbers freed by deleting a trunk or a line
+can be reused. Deleting a line also soft-deletes its handoff overrides.
 
 ### `trunks` — the shape is settled, copy it
 
@@ -899,16 +975,20 @@ decision has already survived contact with multiple carriers, so the column
 set is worth copying rather than rediscovering:
 
 ```
-id            tenant_id        slug            name
-type          inbound | outbound | bi_directional
-carrier       state            status          is_default
+id            tenant_id (NULL = platform)       slug            name
+carrier       state            status
 sip_host      sip_port         sip_username    sip_password (encrypted, bytea)
 sip_auth_method   ip_whitelisting | registration
 signalling_cidrs  media_cidrs    channel_size
-did_range     caller_id_format   metadata jsonb
+did_ranges (int8multirange)      caller_id_format   metadata jsonb
 health_status health_checked_at  health_since
 created_at    updated_at         deleted_at
 ```
+
+There is no `type` and no `is_default`. Direction belongs to the line, not the
+trunk. And there is no default trunk because nothing needs one: an inbound call
+uses the trunk its number is on, an outbound call uses its line's trunk, and an
+E.164 handoff uses the trunk of the call being handed off.
 
 Three columns carry more weight than they look like they do:
 
@@ -931,17 +1011,17 @@ matching entry in `carrier_sip_cidrs` produces calls that never arrive, with
 nothing logged on the edge, because they are dropped before Kamailio sees
 them. The two layers have to be changed together, and nothing enforces that.
 
-### Default trunk — Twilio
+### The platform trunk — Twilio
 
-Twilio is the default trunk for beta. Seed it as:
+Twilio is the platform trunk for beta: no `tenant_id`, its numbers leased to
+tenants line by line. Seed it as:
 
 | Column | Value |
 |---|---|
+| `tenant_id` | null — the platform trunk |
 | `carrier` | `twilio` |
-| `slug` | `twilio-frankfurt` |
-| `type` | `bi_directional` |
-| `is_default` | `true` |
-| `sip_host` | `intron-beta.pstn.frankfurt.twilio.com` |
+| `slug` | `twilio-dublin` |
+| `sip_host` | `intron-beta.pstn.dublin.twilio.com` — the edge nearest eu-west-1 |
 | `sip_port` | `5060` |
 | `sip_auth_method` | `ip_whitelisting` |
 | `sip_username` / `sip_password` | null — IP auth both directions |
@@ -949,20 +1029,26 @@ Twilio is the default trunk for beta. Seed it as:
 | `media_cidrs` | `168.86.128.0/18` |
 | `caller_id_format` | `e164` |
 | `channel_size` | unset — no agreed concurrency cap yet |
+| `did_ranges` | the numbers assigned to the trunk in the Twilio console |
 
-`is_default` means *the trunk chosen for egress when no per-tenant rule
-selects another*. Because trunk selection is application-layer, it happens at
-originate time from this row — Kamailio gets a destination, not a configured
-gateway, which is why the dispatcher has no carrier set and should not grow
-one.
+Because trunk selection is application-layer, it happens per call from these
+rows — Kamailio gets a destination, not a configured gateway, which is why the
+dispatcher has no carrier set and should not grow one.
+
+**Nothing checks the console against these rows.** A drift check against
+Twilio's API existed and was removed: it could read one carrier on one account
+— ours — and most trunks on this platform are not that. The two sides are kept
+in step by hand, and a test call to a number on the trunk is what proves them:
+it exercises origination, the numbers and the edge in one go.
 
 **Two things are Twilio-console work, not Terraform, and both are required
 before a call completes in either direction:**
 
-1. **Origination URI** → `sip:63.182.163.164:5060` (the edge Elastic IP).
+1. **Origination URI** → `sip:<EDGE_EIP>:5060` (the edge Elastic IP — take it
+   from `make output STACK=sip-core ENV=beta EXTRA="-raw edge_public_ips"`).
    Without it Twilio has nowhere to deliver inbound calls, and the symptom is
    silence on our side — no packets, no logs, nothing to debug.
-2. **Termination IP ACL** → add `63.182.163.164`. Twilio authenticates *us*
+2. **Termination IP ACL** → add `<EDGE_EIP>`. Twilio authenticates *us*
    for outbound by source address, since `sip_auth_method` is
    `ip_whitelisting`. Without it, outbound INVITEs are rejected by Twilio with
    a 403 that names our address, which at least fails loudly.
@@ -998,8 +1084,8 @@ change**, so anything the application needs must appear here first.
 
 `control-plane`: `APP_ENV`, `AWS_REGION`, `NODE_ID`, `API_LISTEN_ADDR`,
 `DATABASE_URL`, `DATABASE_MAX_CONNS`, `CONTROL_PLANE_API_TOKEN`,
-`JWT_SIGNING_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`,
-`HEALTH_LISTEN_ADDR`, `HEALTH_PATH`.
+`HEALTH_LISTEN_ADDR`, `HEALTH_PATH`. No `JWT_SIGNING_KEY` (nothing signs a
+token) and no carrier credentials (it calls no carrier's API).
 
 `esl-controller`: `APP_ENV`, `AWS_REGION`, `NODE_ID`, `ESL_LISTEN_ADDR`,
 `ESL_TCP_KEEPALIVE_SECONDS`, `FREESWITCH_NODES`, `FREESWITCH_ESL_PORT`,

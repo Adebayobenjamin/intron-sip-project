@@ -12,7 +12,7 @@ where, how the pieces connect, and the traps found while building it.
 
 ## The short version
 
-We run **our own LiveKit server** in our AWS account (eu-central-1). Our
+We run **our own LiveKit server** in our AWS account (eu-west-1). Our
 Kamailio sends the AI leg of a call to it over a **private** SIP leg inside the
 VPC. The **AI models stay on Intron's GPU box** in their own account
 (eu-west-2): a worker process there connects *out* to our LiveKit server and
@@ -25,7 +25,7 @@ waits to be given calls.
                          │
                          │ SIP + RTP, private, UDP 5060
                          ▼
-          ┌──── our LiveKit box (10.70.0.30, eu-central-1) ────┐
+          ┌──── our LiveKit box (10.70.0.30, eu-west-1) ────┐
           │  livekit-sip ──▶ livekit-server ◀── Caddy (TLS)    │
           └──────────────────────────▲─────────────────────────┘
                                      │ WebRTC + wss://, over the internet
@@ -329,4 +329,4 @@ bridge makes it fail immediately. **Recording is off.**
 
 The long-term fix for most of these is running the agent on a GPU instance in
 **our** account and region, using their code and models. The media path would
-then never leave AWS eu-central-1, and capacity would be ours to size.
+then never leave AWS eu-west-1, and capacity would be ours to size.

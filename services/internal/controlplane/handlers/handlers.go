@@ -35,6 +35,16 @@ func fail(w http.ResponseWriter, code int, msg string) {
 // and the detail belongs in the log, where the operator is, rather than in a
 // response to whoever triggered it.
 func failErr(w http.ResponseWriter, log *slog.Logger, op string, err error) {
+	// A write the database refused because it breaks one of the schema's
+	// rules: numbers already claimed, a line outside its trunk, a slug taken.
+	// The caller's to fix, so 409 with the message — which the store wrote for
+	// exactly this audience — rather than a 500 that sends them to the logs.
+	var conflict *store.ConflictError
+	if errors.As(err, &conflict) {
+		fail(w, http.StatusConflict, conflict.Message)
+		return
+	}
+
 	if errors.Is(err, store.ErrNotFound) {
 		// Also covers rows that exist but belong to another tenant. Answering
 		// 403 for those would confirm they exist, which lets anyone enumerate
@@ -111,7 +121,10 @@ func requireTenant(w http.ResponseWriter, p auth.Principal, requested string) (s
 }
 
 func pathInt64(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
-	raw := r.PathValue(name)
+	return parseInt64(w, r.PathValue(name), name)
+}
+
+func parseInt64(w http.ResponseWriter, raw, name string) (int64, bool) {
 	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
 		fail(w, http.StatusBadRequest, name+" must be a number")

@@ -17,13 +17,13 @@ import (
 func (p *Pool) QueueOriginate(ctx context.Context, r calls.OriginateRequest) (calls.OriginateRequest, error) {
 	err := p.QueryRow(ctx, `
 		INSERT INTO originate_requests (
-			call_uuid, tenant_id, plan_id, from_did, to_number, trunk_id
+			call_uuid, tenant_id, traffic_config_id, from_did, to_number, trunk_id
 		) VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, call_uuid, tenant_id, COALESCE(plan_id, ''), from_did,
+		RETURNING id, call_uuid, tenant_id, COALESCE(traffic_config_id, 0), from_did,
 		          to_number, COALESCE(trunk_id, 0), status, created_at, updated_at`,
-		r.CallUUID, r.TenantID, nullStringArg(r.PlanID),
+		r.CallUUID, r.TenantID, nullInt64Arg(r.TrafficConfigID),
 		r.FromDID, r.ToNumber, nullInt64Arg(r.TrunkID),
-	).Scan(&r.ID, &r.CallUUID, &r.TenantID, &r.PlanID, &r.FromDID,
+	).Scan(&r.ID, &r.CallUUID, &r.TenantID, &r.TrafficConfigID, &r.FromDID,
 		&r.ToNumber, &r.TrunkID, &r.Status, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return calls.OriginateRequest{}, fmt.Errorf("store: queueing originate: %w", err)
@@ -69,15 +69,15 @@ func (p *Pool) ClaimOriginate(ctx context.Context, claimedBy string) (calls.Orig
 				    LIMIT 1)
 			RETURNING *
 		)
-		SELECT c.id, c.call_uuid, c.tenant_id, COALESCE(c.plan_id, ''),
+		SELECT c.id, c.call_uuid, c.tenant_id, COALESCE(c.traffic_config_id, 0),
 		       c.from_did, c.to_number, COALESCE(c.trunk_id, 0),
-		       COALESCE(t.sip_host, ''),
+		       COALESCE(t.sip_host, ''), COALESCE(t.sip_port, 0),
 		       c.status, c.claimed_by, c.claimed_at, c.created_at, c.updated_at
 		  FROM claimed c
 		  LEFT JOIN trunks t ON t.id = c.trunk_id AND t.deleted_at IS NULL`,
 		claimedBy,
-	).Scan(&r.ID, &r.CallUUID, &r.TenantID, &r.PlanID, &r.FromDID,
-		&r.ToNumber, &r.TrunkID, &r.TrunkHost,
+	).Scan(&r.ID, &r.CallUUID, &r.TenantID, &r.TrafficConfigID, &r.FromDID,
+		&r.ToNumber, &r.TrunkID, &r.TrunkHost, &r.TrunkPort,
 		&r.Status, &r.ClaimedBy, &r.ClaimedAt, &r.CreatedAt, &r.UpdatedAt)
 
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -129,13 +129,13 @@ func (p *Pool) GetOriginate(ctx context.Context, callUUID, tenantID string) (cal
 	var r calls.OriginateRequest
 
 	err := p.QueryRow(ctx, `
-		SELECT id, call_uuid, tenant_id, COALESCE(plan_id, ''), from_did, to_number,
+		SELECT id, call_uuid, tenant_id, COALESCE(traffic_config_id, 0), from_did, to_number,
 		       COALESCE(trunk_id, 0), status, COALESCE(claimed_by, ''), claimed_at,
 		       COALESCE(error, ''), created_at, updated_at
 		  FROM originate_requests
 		 WHERE call_uuid = $1 AND ($2::text IS NULL OR tenant_id = $2)`,
 		callUUID, nullStringArg(tenantID),
-	).Scan(&r.ID, &r.CallUUID, &r.TenantID, &r.PlanID, &r.FromDID, &r.ToNumber,
+	).Scan(&r.ID, &r.CallUUID, &r.TenantID, &r.TrafficConfigID, &r.FromDID, &r.ToNumber,
 		&r.TrunkID, &r.Status, &r.ClaimedBy, &r.ClaimedAt, &r.Error,
 		&r.CreatedAt, &r.UpdatedAt)
 
@@ -146,34 +146,4 @@ func (p *Pool) GetOriginate(ctx context.Context, callUUID, tenantID string) (cal
 		return calls.OriginateRequest{}, fmt.Errorf("store: getting originate: %w", err)
 	}
 	return r, nil
-}
-
-// ResolveFromDID checks a DID is usable as a caller ID and returns its trunk.
-//
-// ONE LOOKUP, THREE ANSWERS: whether the tenant owns it (authorisation), what
-// the call presents (caller ID), and which trunk it leaves by. Deriving the
-// trunk from the DID makes a caller-ID/trunk mismatch unrepresentable —
-// carriers verify the calling number belongs to the account the call arrives
-// on, so presenting one tenant's number over another's trunk is a 403.
-func (p *Pool) ResolveFromDID(ctx context.Context, number, tenantID string) (trunkID int64, trunkHost string, err error) {
-	var tid *int64
-	var host string
-
-	err = p.QueryRow(ctx, `
-		SELECT d.trunk_id, COALESCE(t.sip_host, '')
-		  FROM dids d
-		  LEFT JOIN trunks t ON t.id = d.trunk_id AND t.deleted_at IS NULL
-		 WHERE d.number = $1
-		   AND d.tenant_id = $2
-		   AND d.status = 'active'
-		   AND d.deleted_at IS NULL`, number, tenantID).Scan(&tid, &host)
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, "", ErrNotFound
-	}
-	if err != nil {
-		return 0, "", fmt.Errorf("store: resolving from-did: %w", err)
-	}
-
-	return derefInt(tid), host, nil
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# env-file-to-sm — push a KEY=value .env file into an AWS Secrets Manager
-# container as a JSON object.
+# env-file-to-sm — merge a KEY=value .env file into an AWS Secrets Manager
+# container's JSON object. Keys already in the container and absent from the
+# file are kept; see the MERGE note below.
 #
 # Usage:
 #   env-file-to-sm <secret-id> <env-file>
@@ -13,7 +14,7 @@
 # Reads are the inverse: bin/aws-env-run for operators, and
 # /usr/local/bin/fetch-and-render-secrets.sh on the VMs at service start.
 #
-# Authenticates as the klarity_aws profile in eu-central-1 by default, the same
+# Authenticates as the intron_aws profile in eu-west-1 by default, the same
 # identity the Makefiles and every Terraform provider block name. Override with
 # AWS_PROFILE / AWS_REGION. See the Identity block below — it is load-bearing
 # for a script that writes credentials.
@@ -54,8 +55,8 @@ done
 #
 # The profile deliberately carries no region (see ~/.aws/config), so AWS_REGION
 # has to be set too or every call fails with NoRegion.
-export AWS_PROFILE="${AWS_PROFILE:-klarity_aws}"
-export AWS_REGION="${AWS_REGION:-eu-central-1}"
+export AWS_PROFILE="${AWS_PROFILE:-intron_aws}"
+export AWS_REGION="${AWS_REGION:-eu-west-1}"
 
 # Build the JSON object from the file. Comments and blanks are skipped; the
 # first `=` splits key from value, so values may contain `=` freely. Surrounding
@@ -75,17 +76,55 @@ payload=$(
 
 count=$(jq -r 'length' <<<"$payload")
 if [[ "$count" == "0" ]]; then
-  echo "env-file-to-sm: $env_file produced no keys — refusing to overwrite $secret_id with {}" >&2
+  echo "env-file-to-sm: $env_file produced no keys — nothing to write to $secret_id" >&2
   exit 1
 fi
+
+# MERGE, not overwrite, matching bin/db-dsn-to-sm. Containers are written by
+# more than one hand — db-dsn-to-sm adds DATABASE_URL to the controller and
+# control-plane containers — and a put carrying only this file's keys would
+# silently delete everything else. Keys in the file win over keys already
+# there.
+#
+# The flip side: a key REMOVED from the file stays in the secret. Deleting a
+# key is a deliberate act, not a side effect of editing a file:
+#
+#   aws secretsmanager get-secret-value --secret-id <id> --query SecretString \
+#     --output text | jq 'del(.OLD_KEY)' | aws secretsmanager put-secret-value \
+#     --secret-id <id> --secret-string file:///dev/stdin
+#
+# Only "this container has no value yet" counts as empty. Any other read
+# failure — throttling, a network blip, a permissions gap — aborts, because
+# treating it as {} would turn the merge into exactly the overwrite this exists
+# to prevent.
+existing='{}'
+if ! current=$(aws secretsmanager get-secret-value --secret-id "$secret_id" \
+      --query SecretString --output text 2>&1); then
+  if [[ "$current" == *ResourceNotFoundException* && "$current" == *AWSCURRENT* ]]; then
+    existing='{}'
+  else
+    echo "env-file-to-sm: could not read the current value of $secret_id — refusing to write" >&2
+    echo "$current" >&2
+    exit 1
+  fi
+elif jq -e 'type == "object"' >/dev/null 2>&1 <<<"$current"; then
+  existing="$current"
+else
+  echo "env-file-to-sm: $secret_id holds something that is not a JSON object — refusing to overwrite it" >&2
+  exit 1
+fi
+
+merged=$(jq -n --argjson a "$existing" --argjson b "$payload" '$a + $b')
 
 # put-secret-value creates a NEW version and moves AWSCURRENT to it. The
 # previous version stays as AWSPREVIOUS, so a bad push is one
 # `update-secret-version-stage` away from being undone.
 aws secretsmanager put-secret-value \
   --secret-id "$secret_id" \
-  --secret-string "$payload" \
+  --secret-string "$merged" \
   --output json \
   --query '{Name:Name,VersionId:VersionId}'
 
-echo "env-file-to-sm: wrote $count key(s) from $env_file to $secret_id"
+kept=$(jq -r 'keys | join(", ")' <<<"$merged")
+echo "env-file-to-sm: merged $count key(s) from $env_file into $secret_id"
+echo "  container now holds: ${kept}"

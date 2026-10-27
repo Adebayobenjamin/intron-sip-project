@@ -33,15 +33,14 @@ func (f *fakeLookup) ResolveNumber(_ context.Context, number string) (Route, err
 
 func liveRoute() Route {
 	return Route{
-		Number:       "+4930123456",
-		TenantID:     "t1",
-		TenantActive: true,
-		DIDActive:    true,
-		PlanID:       "p1",
-		PlanActive:   true,
-		Destination:  DestinationAI,
-		Recording:    true,
-		TrunkID:      7,
+		Number:          "+4930123456",
+		TenantID:        "t1",
+		TenantActive:    true,
+		TrafficConfigID: 11,
+		ConfigActive:    true,
+		Destination:     DestinationAI,
+		RecordingMode:   RecordingAIOnly,
+		TrunkID:         7,
 	}
 }
 
@@ -78,8 +77,9 @@ func TestNormalise(t *testing.T) {
 	}
 }
 
-// Every shape of the same number must reach one cache entry and one row.
-// Otherwise the unique index on dids.number does not mean what it says.
+// Every shape of the same number must reach one cache entry and one lookup.
+// Otherwise the same caller dialling the same number twice could get two
+// different answers.
 func TestNormalise_ShapesConverge(t *testing.T) {
 	want := Normalise("+4930123456")
 	for _, in := range []string{"4930123456", "004930123456", "+49 30 123 456"} {
@@ -112,27 +112,33 @@ func TestEvaluate(t *testing.T) {
 			wantReason: ReasonTenantSuspended,
 		},
 		{
-			name:       "deactivated number",
-			mutate:     func(r *Route) { r.DIDActive = false },
-			wantReason: ReasonDIDInactive,
+			// A trunk carries the number and no line covers it. Ours, and
+			// nobody said what to do with it — a different problem from an
+			// unknown number, with a different fix.
+			name:       "no line configured",
+			mutate:     func(r *Route) { r.TrafficConfigID = 0; r.ConfigActive = false },
+			wantReason: ReasonNoTrafficConfig,
 		},
 		{
-			// Provisioned but never configured. Ours, and nobody said what to
-			// do with it — a different problem from an unknown number, with a
-			// different fix.
-			name:       "no plan attached",
-			mutate:     func(r *Route) { r.PlanID = ""; r.PlanActive = false },
-			wantReason: ReasonNoPlan,
+			// The platform trunk with no line: no tenant at all yet. Must not
+			// read as a suspended tenant, which would name a tenant that does
+			// not exist.
+			name: "platform number with no line and no tenant",
+			mutate: func(r *Route) {
+				r.TenantID, r.TenantActive = "", false
+				r.TrafficConfigID, r.ConfigActive = 0, false
+			},
+			wantReason: ReasonNoTrafficConfig,
 		},
 		{
-			name:       "plan switched off",
-			mutate:     func(r *Route) { r.PlanActive = false },
-			wantReason: ReasonPlanInactive,
+			name:       "line switched off",
+			mutate:     func(r *Route) { r.ConfigActive = false },
+			wantReason: ReasonTrafficConfigInactive,
 		},
 		{
-			name:       "plan configured to refuse",
+			name:       "line configured to refuse",
 			mutate:     func(r *Route) { r.Destination = DestinationReject },
-			wantReason: ReasonPlanRejects,
+			wantReason: ReasonTrafficConfigRejects,
 		},
 	}
 
@@ -152,23 +158,22 @@ func TestEvaluate(t *testing.T) {
 	}
 }
 
-// A suspended tenant whose plan is also inactive must read as suspended. That
-// is the fact someone needs; "plan inactive" would send them to the wrong
+// A suspended tenant whose line is also inactive must read as suspended. That
+// is the fact someone needs; "line inactive" would send them to the wrong
 // screen.
 func TestEvaluate_MostUsefulReasonWins(t *testing.T) {
 	r := liveRoute()
 	r.TenantActive = false
-	r.PlanActive = false
-	r.DIDActive = false
+	r.ConfigActive = false
 
 	if got := evaluate(r).Reason; got != ReasonTenantSuspended {
 		t.Errorf("Reason = %q, want %q", got, ReasonTenantSuspended)
 	}
 }
 
-// An admitted verdict must carry the plan, not just ids. The controller needs
+// An admitted verdict must carry the line, not just ids. The controller needs
 // it, and a second query per call is what this avoids.
-func TestResolve_CarriesThePlan(t *testing.T) {
+func TestResolve_CarriesTheLine(t *testing.T) {
 	f := &fakeLookup{routes: map[string]Route{"+4930123456": liveRoute()}}
 
 	v, err := newService(f).Resolve(context.Background(), "+4930123456")
@@ -178,8 +183,9 @@ func TestResolve_CarriesThePlan(t *testing.T) {
 	if !v.Admitted {
 		t.Fatalf("want admitted, got %q", v.Reason)
 	}
-	if v.Destination != DestinationAI || !v.Recording || v.TrunkID != 7 {
-		t.Errorf("plan not carried through: %+v", v)
+	if v.Destination != DestinationAI || v.RecordingMode != RecordingAIOnly ||
+		v.TrunkID != 7 || v.TrafficConfigID != 11 {
+		t.Errorf("line not carried through: %+v", v)
 	}
 }
 

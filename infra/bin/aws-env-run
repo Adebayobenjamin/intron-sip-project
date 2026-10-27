@@ -13,7 +13,7 @@
 # Usage:
 #   aws-env-run <secret-id> [--] <cmd> [args...]
 #
-# AWS authentication defaults to the klarity_aws profile in eu-central-1, the
+# AWS authentication defaults to the intron_aws profile in eu-west-1, the
 # same identity the Makefiles and every Terraform provider block name. Override
 # with AWS_PROFILE / AWS_REGION. See the Identity block below.
 #
@@ -75,8 +75,8 @@ done
 #
 # The profile deliberately carries no region (see ~/.aws/config), so AWS_REGION
 # has to be set too or every call fails with NoRegion.
-export AWS_PROFILE="${AWS_PROFILE:-klarity_aws}"
-export AWS_REGION="${AWS_REGION:-eu-central-1}"
+export AWS_PROFILE="${AWS_PROFILE:-intron_aws}"
+export AWS_REGION="${AWS_REGION:-eu-west-1}"
 
 # SecretString lands on stdout; no temp file involved.
 secret_json=$(aws secretsmanager get-secret-value \

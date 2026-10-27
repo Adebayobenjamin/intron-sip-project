@@ -1,6 +1,5 @@
 // Command control-plane serves the configuration and action API: operator
-// CRUD, Twilio trunk management, and the endpoints that queue work for the
-// ESL controller.
+// CRUD, read models, and the endpoints that queue work for the ESL controller.
 //
 // Nothing it serves is in the path of a call. It is also the ONLY migrator —
 // esl-controller shares the database but never applies migrations, because two

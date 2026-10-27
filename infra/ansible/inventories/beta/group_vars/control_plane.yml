@@ -7,8 +7,8 @@
 # registry credential to distribute and nothing is built on the box.
 ########################################################
 
-# Account 023585529698 — from the ecr stack's repository_urls output.
-ecr_registry: "023585529698.dkr.ecr.{{ aws_region }}.amazonaws.com"
+# Account 261326853223 — from the ecr stack's repository_urls output.
+ecr_registry: "261326853223.dkr.ecr.{{ aws_region }}.amazonaws.com"
 
 ########################################################
 # Services. Each entry becomes one systemd unit.
@@ -45,7 +45,7 @@ ecr_registry: "023585529698.dkr.ecr.{{ aws_region }}.amazonaws.com"
 app_services:
   - name: control-plane
     repository: intron-sip/control-plane
-    image_tag: v0.1.2
+    image_tag: v0.2.5
     secret_id: "{{ control_plane_secret_id }}"
     health_port: "{{ control_plane_health_port }}"
     ports:
@@ -56,7 +56,7 @@ app_services:
 
   - name: esl-controller
     repository: intron-sip/esl-controller
-    image_tag: v0.1.2
+    image_tag: v0.2.5
     secret_id: "{{ esl_controller_secret_id }}"
     health_port: "{{ esl_controller_health_port }}"
     ports:

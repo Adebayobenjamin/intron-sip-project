@@ -26,11 +26,11 @@ const (
 	// startupTimeout bounds the first connection and the schema check.
 	startupTimeout = 60 * time.Second
 
-	// warmLimit caps how many DIDs are preloaded. A guard rather than a
+	// warmLimit caps how many numbers are preloaded. A guard rather than a
 	// policy: a warm that quietly loads a million rows is a slow startup
-	// nobody attributes to this. Ranges are not enumerated — one can cover
-	// ten thousand numbers, and materialising them would evict everything
-	// else to hold numbers nobody has called.
+	// nobody attributes to this. Only small inbound blocks are enumerated —
+	// see store.ActiveRoutes — because materialising a large one would evict
+	// everything else to hold numbers nobody has called.
 	warmLimit = 5000
 )
 

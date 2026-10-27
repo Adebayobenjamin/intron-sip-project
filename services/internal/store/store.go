@@ -4,7 +4,7 @@
 // # Why both services import this
 //
 // esl-controller and control-plane read the same tables. Two hand-written
-// copies of "resolve a DID" drift — one gets the deleted_at filter and the
+// copies of "resolve a number" drift — one gets the deleted_at filter and the
 // other does not — and the difference surfaces as a call routed to a tenant
 // removed last week. One package, two callers.
 //

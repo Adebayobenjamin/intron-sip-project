@@ -17,11 +17,12 @@ func seedOutbound(t *testing.T, pool *Pool) {
 
 	mustExec(t, pool, `INSERT INTO tenants (id, name) VALUES ('t1', 'One')`)
 	mustExec(t, pool, `
-		INSERT INTO trunks (id, slug, name, type, carrier, sip_auth_method, sip_host)
-		VALUES (7, 'twilio', 'Twilio', 'bi_directional', 'twilio', 'ip_whitelisting',
-		        'intron-beta.pstn.frankfurt.twilio.com')`)
+		INSERT INTO trunks (id, slug, name, carrier, sip_auth_method, sip_host, did_ranges)
+		VALUES (7, 'twilio', 'Twilio', 'twilio', 'ip_whitelisting',
+		        'intron-beta.pstn.dublin.twilio.com', '{[4930123400,4930123500)}')`)
 	mustExec(t, pool, `
-		INSERT INTO dids (number, tenant_id, trunk_id) VALUES ('+4930123456', 't1', 7)`)
+		INSERT INTO traffic_configs (tenant_id, trunk_id, name, direction, did_ranges, destination, recording_mode)
+		VALUES ('t1', 7, 'Campaign', 'outbound', '{[4930123450,4930123460)}', 'ai', 'full')`)
 }
 
 func queued(uuid string) calls.OriginateRequest {
@@ -63,7 +64,7 @@ func TestClaimOriginate_CarriesTheTrunkHost(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim failed: ok=%v err=%v", ok, err)
 	}
-	if r.TrunkHost != "intron-beta.pstn.frankfurt.twilio.com" {
+	if r.TrunkHost != "intron-beta.pstn.dublin.twilio.com" {
 		t.Errorf("TrunkHost = %q", r.TrunkHost)
 	}
 	if r.ClaimedBy != "node-1" {
@@ -242,43 +243,62 @@ func TestGetOriginate_IsTenantScoped(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The from-DID: one lookup, three answers
+// The from-number: one lookup, three answers
 // ---------------------------------------------------------------------------
 
-func TestResolveFromDID_ReturnsTheTrunk(t *testing.T) {
+func TestResolveOutbound_ReturnsTheLineAndItsTrunk(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedPool(t)
 	seedOutbound(t, pool)
 
-	id, host, err := pool.ResolveFromDID(ctx, "+4930123456", "t1")
+	l, err := pool.ResolveOutbound(ctx, "+4930123456", "t1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if id != 7 || host != "intron-beta.pstn.frankfurt.twilio.com" {
-		t.Errorf("trunk = %d/%q", id, host)
+	if l.TrafficConfigID == 0 || l.TrunkID != 7 || l.TrunkHost != "intron-beta.pstn.dublin.twilio.com" {
+		t.Errorf("line = %+v", l)
+	}
+	// The recording mode travels with it, so the claim can snapshot it.
+	if l.RecordingMode != "full" {
+		t.Errorf("RecordingMode = %q, want full", l.RecordingMode)
 	}
 }
 
 // The authorisation check. Without it anyone reaching the API can present any
 // number on the platform, including another tenant's.
-func TestResolveFromDID_RefusesAnotherTenantsNumber(t *testing.T) {
+func TestResolveOutbound_RefusesAnotherTenantsNumber(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedPool(t)
 	seedOutbound(t, pool)
 	mustExec(t, pool, `INSERT INTO tenants (id, name) VALUES ('t2', 'Two')`)
 
-	if _, _, err := pool.ResolveFromDID(ctx, "+4930123456", "t2"); !errors.Is(err, ErrNotFound) {
+	if _, err := pool.ResolveOutbound(ctx, "+4930123456", "t2"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("a tenant presented another tenant's number: %v", err)
 	}
 }
 
-func TestResolveFromDID_RefusesAnInactiveNumber(t *testing.T) {
+func TestResolveOutbound_RefusesAnInactiveLine(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedPool(t)
 	seedOutbound(t, pool)
-	mustExec(t, pool, `UPDATE dids SET status = 'inactive' WHERE number = '+4930123456'`)
+	mustExec(t, pool, `UPDATE traffic_configs SET status = 'inactive'`)
 
-	if _, _, err := pool.ResolveFromDID(ctx, "+4930123456", "t1"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("an inactive DID was accepted as a caller ID: %v", err)
+	if _, err := pool.ResolveOutbound(ctx, "+4930123456", "t1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("an inactive line was accepted for a caller ID: %v", err)
+	}
+}
+
+// A number on the trunk but outside the outbound line — or inside only an
+// INBOUND one — is not a number the tenant may dial out from.
+func TestResolveOutbound_OnlyOutboundLinesCount(t *testing.T) {
+	ctx := context.Background()
+	pool := migratedPool(t)
+	seedOutbound(t, pool)
+	mustExec(t, pool, `
+		INSERT INTO traffic_configs (tenant_id, trunk_id, name, direction, did_ranges, destination)
+		VALUES ('t1', 7, 'Main', 'inbound', '{[4930123400,4930123410)}', 'ai')`)
+
+	if _, err := pool.ResolveOutbound(ctx, "+4930123405", "t1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("an inbound-only number was accepted as an outbound caller ID: %v", err)
 	}
 }

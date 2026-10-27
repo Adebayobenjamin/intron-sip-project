@@ -58,15 +58,20 @@ var ErrNoLiveCall = errors.New("calls: no call in progress with that uuid")
 
 // Claim is the request to take a concurrency slot.
 type Claim struct {
-	UUID      string
-	TenantID  string
-	PlanID    string
-	TrunkID   int64
-	Direction string
-	DID       string
-	Caller    string
-	Callee    string
-	Node      string
+	UUID            string
+	TenantID        string
+	TrafficConfigID int64
+	TrunkID         int64
+	Direction       string
+	DID             string
+	Caller          string
+	Callee          string
+	Node            string
+
+	// RecordingMode is snapshotted onto the live row here, at the start of the
+	// call, and read back by a transferred leg rather than re-read from the
+	// line. See calls.recording_mode in the schema.
+	RecordingMode string
 }
 
 // Record is a finished call, written to call_history.
@@ -77,10 +82,10 @@ type Record struct {
 	UUID      string
 	SIPCallID string
 
-	TenantID  string
-	PlanID    string
-	TrunkID   int64
-	Direction string
+	TenantID        string
+	TrafficConfigID int64
+	TrunkID         int64
+	Direction       string
 
 	DID    string
 	Caller string
@@ -88,6 +93,7 @@ type Record struct {
 
 	HandoffTargetID int64
 	LiveKitRoom     string
+	RecordingMode   string
 	Node            string
 
 	InviteAt time.Time
@@ -177,9 +183,10 @@ func (r Record) Args() []any {
 		nullString(r.Caller),
 		nullString(r.Callee),
 		nullInt64(r.TrunkID),
-		nullString(r.PlanID),
+		nullInt64(r.TrafficConfigID),
 		nullInt64(r.HandoffTargetID),
 		nullString(r.LiveKitRoom),
+		nullString(r.RecordingMode),
 		nullString(r.Node),
 		nullTime(r.InviteAt),
 		nullTime(r.RingAt),

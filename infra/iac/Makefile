@@ -21,10 +21,10 @@
 
 STACK      ?=
 ENV        ?= beta
-AWS_REGION ?= eu-central-1
+AWS_REGION ?= eu-west-1
 
 ########################################################
-# CREDENTIALS — the klarity_aws shared-config profile.
+# CREDENTIALS — the intron_aws shared-config profile.
 #
 # Terraform does not depend on this being exported: every provider block, every
 # backend block and every terraform_remote_state lookup names the profile
@@ -37,7 +37,7 @@ AWS_REGION ?= eu-central-1
 # (aws-env-run, env-file-to-sm), which have no provider block to read.
 #
 # AWS_REGION is exported for the same reason and is NOT optional: the
-# klarity_aws profile carries no region in ~/.aws/config, so without this every
+# intron_aws profile carries no region in ~/.aws/config, so without this every
 # CLI call fails with NoRegion. Terraform itself is unaffected — its region
 # comes from var.aws_region and from the literal in each backend block.
 #
@@ -47,13 +47,13 @@ AWS_REGION ?= eu-central-1
 # environment credentials, so the MFA session would be silently ignored while
 # appearing to be in use.
 #
-# If the klarity_aws identity ever gains a RequireMFA policy, the fix is in
+# If the intron_aws identity ever gains a RequireMFA policy, the fix is in
 # ~/.aws/config, not here — add an assume-role profile with `mfa_serial` and
 # point AWS_PROFILE at it. The AWS SDK prompts for the token and caches the
 # session itself. bin/with-mfa hand-rolled that and has been deleted: nothing
 # called it once Ansible moved to the profile too, and the SDK does it better.
 ########################################################
-AWS_PROFILE ?= klarity_aws
+AWS_PROFILE ?= intron_aws
 
 BIN_DIR     := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../bin)
 AWS_ENV_RUN := $(BIN_DIR)/aws-env-run

@@ -1,13 +1,13 @@
 variable "aws_region" {
   type        = string
   description = "See stacks/network/beta/variables.tf for the region rationale."
-  default     = "eu-central-1"
+  default     = "eu-west-1"
 }
 
 variable "state_bucket" {
   type        = string
   description = "State bucket, created by the tfstate stack. Used for the four remote_state lookups in ../_main/remote-state.tf."
-  default     = "intron-sip-tfstate-eu-central-1"
+  default     = "intron-sip-tfstate-eu-west-1"
 }
 
 variable "aws_profile" {
@@ -37,5 +37,5 @@ variable "aws_profile" {
     but means any bare `aws` CLI call needs AWS_REGION set. The Makefile
     exports it.
   DESC
-  default     = "klarity_aws"
+  default     = "intron_aws"
 }

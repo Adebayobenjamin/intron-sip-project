@@ -223,20 +223,21 @@ func (l *Listener) transferVerdict(
 		"original_did", live.DID)
 
 	return admission.Verdict{
-		Admitted:    true,
-		TenantID:    live.TenantID,
-		PlanID:      live.PlanID,
-		Destination: admission.DestinationHandoff,
+		Admitted:        true,
+		TenantID:        live.TenantID,
+		TrafficConfigID: live.TrafficConfigID,
+		Destination:     admission.DestinationHandoff,
 
-		// TrunkID is deliberately left zero. route.Handoff dials the tenant's
-		// targets and never reads it, and trunk_id is not in the history
-		// upsert's update list — so the value the ORIGINAL leg recorded is
-		// preserved rather than overwritten with a guess from this one.
-		//
-		// Recording is deliberately NOT carried over. The original leg's
-		// recording belongs to the AI conversation; whether a human handoff is
-		// recorded is a separate decision, and inheriting it would start a
-		// recording nobody asked for on the leg most likely to be sensitive.
-		Recording: false,
+		// The call's own trunk, read from the row the original leg claimed. An
+		// E.164 handoff is a new call placed through this carrier — the one the
+		// line's numbers live on — which is also why it cannot come from the
+		// tenant: a tenant on the platform trunk has no trunk of its own.
+		TrunkID: live.TrunkID,
+
+		// The mode snapshotted when the call started, not the line's current
+		// value. The transferred leg uses it to STOP an ai_only recording —
+		// see recordingActionFor for why stopping, not merely not starting, is
+		// what keeps the human half unrecorded.
+		RecordingMode: admission.RecordingMode(live.RecordingMode),
 	}, live
 }

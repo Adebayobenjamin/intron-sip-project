@@ -6,13 +6,13 @@ terraform {
   # older CLI this parses and silently does nothing, so check
   # `terraform version` before trusting concurrent applies not to race.
   backend "s3" {
-    bucket = "intron-sip-tfstate-eu-central-1"
+    bucket = "intron-sip-tfstate-eu-west-1"
     key    = "stacks/network/beta/terraform.tfstate"
-    region = "eu-central-1"
+    region = "eu-west-1"
     # Literal, not var.aws_profile: a backend block cannot
     # interpolate. Override per-invocation with
     # `terraform init -backend-config=profile=<other>`.
-    profile      = "klarity_aws"
+    profile      = "intron_aws"
     encrypt      = true
     use_lockfile = true
   }

@@ -4,10 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"strings"
 
-	"github.com/Adebayobenjamin/intron-sip-project/services/internal/admission"
-	"github.com/Adebayobenjamin/intron-sip-project/services/internal/route"
 	"github.com/Adebayobenjamin/intron-sip-project/services/internal/store"
 )
 
@@ -18,29 +15,22 @@ type Config interface {
 	GetTenant(ctx context.Context, id string) (store.Tenant, error)
 	UpdateTenant(ctx context.Context, id string, name, status *string, cap *int, clearCap bool) (store.Tenant, error)
 	DeleteTenant(ctx context.Context, id string) error
-
-	CreatePlan(ctx context.Context, p store.Plan) (store.Plan, error)
-	UpsertAgentConfig(ctx context.Context, tenantID, planID string, c route.AgentConfig) error
-	ListPlans(ctx context.Context, tenantID string) ([]store.Plan, error)
-	UpdatePlan(ctx context.Context, id, tenantID string, name, status, destination *string, recording *bool) (store.Plan, error)
-	DeletePlan(ctx context.Context, id, tenantID string) error
-
-	CreateDID(ctx context.Context, d store.DID) (store.DID, error)
-	ListDIDs(ctx context.Context, tenantID string) ([]store.DID, error)
-	UpdateDID(ctx context.Context, id int64, tenantID string, planID *string, trunkID *int64, status *string) (store.DID, error)
-	DeleteDID(ctx context.Context, id int64, tenantID string) error
 }
 
-// Invalidator lets a write drop the cached answer it just made stale.
+// Invalidator lets a write drop the cached answers it just made stale.
 //
 // Only this process's cache. The controller runs its own and expires on its
 // own TTL, so an edit still takes up to that long to reach a live call — which
 // is the documented staleness budget, not something this can fix.
+//
+// Everything, not one number: a change to a trunk or a line moves whole
+// blocks, and working out which cached numbers fall inside them costs more
+// than refilling a cache that warms itself on the next call.
 type Invalidator interface {
-	Invalidate(number string)
+	InvalidateAll()
 }
 
-// ConfigHandler serves the configuration resources.
+// ConfigHandler serves tenants.
 type ConfigHandler struct {
 	Store     Config
 	Admission Invalidator
@@ -154,6 +144,7 @@ func (h ConfigHandler) UpdateTenant(w http.ResponseWriter, r *http.Request) {
 
 	// Suspending a tenant must stop its calls promptly, and this process's
 	// cached admission answers would otherwise keep admitting them for a TTL.
+	invalidateAll(h.Admission)
 	h.Log.Info("tenant updated", "tenant", id, "by", p.Label)
 	respond(w, http.StatusOK, t)
 }
@@ -177,323 +168,10 @@ func (h ConfigHandler) DeleteTenant(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ---------------------------------------------------------------------------
-// Plans
-// ---------------------------------------------------------------------------
-
-func (h ConfigHandler) CreatePlan(w http.ResponseWriter, r *http.Request) {
-	p, ok := principal(w, r, h.Log)
-	if !ok {
-		return
-	}
-
-	// The agent settings are part of the PLAN, not a separate resource. One
-	// row per plan, set when the plan is created — and a plan routing to `ai`
-	// with no agent config is a call that gets refused pre-answer, so the two
-	// belong in one request rather than in two someone can do half of.
-	var req struct {
-		ID          string `json:"id"`
-		TenantID    string `json:"tenant_id"`
-		Name        string `json:"name"`
-		Status      string `json:"status"`
-		Destination string `json:"destination"`
-		Recording   bool   `json:"recording"`
-
-		AgentIdentity string `json:"agent_identity"`
-		RoomTemplate  string `json:"room_template"`
-	}
-	if !decode(w, r, &req) {
-		return
-	}
-
-	tenant, ok := requireTenant(w, p, req.TenantID)
-	if !ok {
-		return
-	}
-
-	if req.ID == "" || req.Name == "" {
-		fail(w, http.StatusBadRequest, "id and name are required")
-		return
-	}
-	if !validDestination(req.Destination) {
-		// Checked here as well as by the database so the message names the
-		// allowed values instead of quoting a constraint.
-		fail(w, http.StatusBadRequest, "destination must be one of: ai, handoff, reject")
-		return
-	}
-
-	// A plan routing to the AI leg needs an agent. Refusing here means the
-	// failure happens where someone is looking, rather than on the first call
-	// to the number — which is refused pre-answer with a temporary failure and
-	// tells the caller nothing.
-	if req.Destination == string(admission.DestinationAI) && req.AgentIdentity == "" {
-		fail(w, http.StatusBadRequest,
-			"agent_identity is required for a plan with destination=ai")
-		return
-	}
-	if req.Destination != string(admission.DestinationAI) &&
-		(req.AgentIdentity != "" || req.RoomTemplate != "") {
-		fail(w, http.StatusBadRequest,
-			"agent_identity and room_template only apply to destination=ai")
-		return
-	}
-
-	pl, err := h.Store.CreatePlan(r.Context(), store.Plan{
-		ID: req.ID, TenantID: tenant, Name: req.Name,
-		Status: req.Status, Destination: req.Destination, Recording: req.Recording,
-	})
-	if err != nil {
-		failErr(w, h.Log, "create plan", err)
-		return
-	}
-
-	if req.AgentIdentity != "" {
-		if err := h.Store.UpsertAgentConfig(r.Context(), tenant, pl.ID, route.AgentConfig{
-			RoomTemplate:  req.RoomTemplate,
-			AgentIdentity: req.AgentIdentity,
-		}); err != nil {
-			// The plan exists and cannot route. Say so plainly rather than
-			// returning a 201 for something that will refuse every call.
-			failErr(w, h.Log, "attach agent config", err)
-			return
-		}
-	}
-
-	h.Log.Info("plan created", "plan", pl.ID, "tenant", tenant,
-		"destination", pl.Destination, "by", p.Label)
-	respond(w, http.StatusCreated, pl)
-}
-
-func (h ConfigHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
-	p, ok := principal(w, r, h.Log)
-	if !ok {
-		return
-	}
-	tenant, ok := scopeTenant(w, p, r.URL.Query().Get("tenant_id"))
-	if !ok {
-		return
-	}
-
-	list, err := h.Store.ListPlans(r.Context(), tenant)
-	if err != nil {
-		failErr(w, h.Log, "list plans", err)
-		return
-	}
-	respond(w, http.StatusOK, list)
-}
-
-func (h ConfigHandler) UpdatePlan(w http.ResponseWriter, r *http.Request) {
-	p, ok := principal(w, r, h.Log)
-	if !ok {
-		return
-	}
-	tenant, ok := scopeTenant(w, p, "")
-	if !ok {
-		return
-	}
-
-	var req struct {
-		Name        *string `json:"name"`
-		Status      *string `json:"status"`
-		Destination *string `json:"destination"`
-		Recording   *bool   `json:"recording"`
-
-		AgentIdentity *string `json:"agent_identity"`
-		RoomTemplate  *string `json:"room_template"`
-	}
-	if !decode(w, r, &req) {
-		return
-	}
-
-	if req.Destination != nil && !validDestination(*req.Destination) {
-		fail(w, http.StatusBadRequest, "destination must be one of: ai, handoff, reject")
-		return
-	}
-
-	pl, err := h.Store.UpdatePlan(r.Context(), r.PathValue("id"), tenant,
-		req.Name, req.Status, req.Destination, req.Recording)
-	if err != nil {
-		failErr(w, h.Log, "update plan", err)
-		return
-	}
-
-	if req.AgentIdentity != nil || req.RoomTemplate != nil {
-		cfg := route.AgentConfig{}
-		if req.AgentIdentity != nil {
-			cfg.AgentIdentity = *req.AgentIdentity
-		}
-		if req.RoomTemplate != nil {
-			cfg.RoomTemplate = *req.RoomTemplate
-		}
-		if err := h.Store.UpsertAgentConfig(r.Context(), pl.TenantID, pl.ID, cfg); err != nil {
-			failErr(w, h.Log, "update agent config", err)
-			return
-		}
-	}
-
-	h.Log.Info("plan updated", "plan", pl.ID, "by", p.Label)
-	respond(w, http.StatusOK, pl)
-}
-
-func (h ConfigHandler) DeletePlan(w http.ResponseWriter, r *http.Request) {
-	p, ok := principal(w, r, h.Log)
-	if !ok {
-		return
-	}
-	tenant, ok := scopeTenant(w, p, "")
-	if !ok {
-		return
-	}
-
-	if err := h.Store.DeletePlan(r.Context(), r.PathValue("id"), tenant); err != nil {
-		failErr(w, h.Log, "delete plan", err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func validDestination(d string) bool {
-	switch d {
-	case string(admission.DestinationAI),
-		string(admission.DestinationHandoff),
-		string(admission.DestinationReject):
-		return true
-	}
-	return false
-}
-
-// ---------------------------------------------------------------------------
-// DIDs
-// ---------------------------------------------------------------------------
-
-func (h ConfigHandler) CreateDID(w http.ResponseWriter, r *http.Request) {
-	p, ok := principal(w, r, h.Log)
-	if !ok {
-		return
-	}
-
-	var req struct {
-		Number   string `json:"number"`
-		TenantID string `json:"tenant_id"`
-		PlanID   string `json:"plan_id"`
-		TrunkID  int64  `json:"trunk_id"`
-		Status   string `json:"status"`
-	}
-	if !decode(w, r, &req) {
-		return
-	}
-
-	tenant, ok := requireTenant(w, p, req.TenantID)
-	if !ok {
-		return
-	}
-
-	// NORMALISED ON WRITE, so the unique index means what it says and a lookup
-	// cannot miss a number that is plainly in the table. The same function the
-	// call path uses, deliberately — two implementations would eventually
-	// disagree about what a number looks like.
-	number := admission.Normalise(req.Number)
-	if number == "" {
-		fail(w, http.StatusBadRequest, "number must contain digits, e.g. +4930123456")
-		return
-	}
-	if number != strings.TrimSpace(req.Number) {
-		h.Log.Info("did normalised on write", "given", req.Number, "stored", number)
-	}
-
-	d, err := h.Store.CreateDID(r.Context(), store.DID{
-		Number: number, TenantID: tenant, PlanID: req.PlanID,
-		TrunkID: req.TrunkID, Status: req.Status,
-	})
-	if err != nil {
-		failErr(w, h.Log, "create did", err)
-		return
-	}
-
-	// Drop the negative cache entry. A number provisioned a moment ago is
-	// exactly the one someone is about to test, and a cached miss would refuse
-	// it for the negative TTL.
-	h.invalidate(number)
-
-	h.Log.Info("did created", "number", number, "tenant", tenant, "by", p.Label)
-	respond(w, http.StatusCreated, d)
-}
-
-func (h ConfigHandler) ListDIDs(w http.ResponseWriter, r *http.Request) {
-	p, ok := principal(w, r, h.Log)
-	if !ok {
-		return
-	}
-	tenant, ok := scopeTenant(w, p, r.URL.Query().Get("tenant_id"))
-	if !ok {
-		return
-	}
-
-	list, err := h.Store.ListDIDs(r.Context(), tenant)
-	if err != nil {
-		failErr(w, h.Log, "list dids", err)
-		return
-	}
-	respond(w, http.StatusOK, list)
-}
-
-func (h ConfigHandler) UpdateDID(w http.ResponseWriter, r *http.Request) {
-	p, ok := principal(w, r, h.Log)
-	if !ok {
-		return
-	}
-	tenant, ok := scopeTenant(w, p, "")
-	if !ok {
-		return
-	}
-	id, ok := pathInt64(w, r, "id")
-	if !ok {
-		return
-	}
-
-	var req struct {
-		PlanID  *string `json:"plan_id"`
-		TrunkID *int64  `json:"trunk_id"`
-		Status  *string `json:"status"`
-	}
-	if !decode(w, r, &req) {
-		return
-	}
-
-	d, err := h.Store.UpdateDID(r.Context(), id, tenant, req.PlanID, req.TrunkID, req.Status)
-	if err != nil {
-		failErr(w, h.Log, "update did", err)
-		return
-	}
-
-	h.invalidate(d.Number)
-	h.Log.Info("did updated", "number", d.Number, "by", p.Label)
-	respond(w, http.StatusOK, d)
-}
-
-func (h ConfigHandler) DeleteDID(w http.ResponseWriter, r *http.Request) {
-	p, ok := principal(w, r, h.Log)
-	if !ok {
-		return
-	}
-	tenant, ok := scopeTenant(w, p, "")
-	if !ok {
-		return
-	}
-	id, ok := pathInt64(w, r, "id")
-	if !ok {
-		return
-	}
-
-	if err := h.Store.DeleteDID(r.Context(), id, tenant); err != nil {
-		failErr(w, h.Log, "delete did", err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h ConfigHandler) invalidate(number string) {
-	if h.Admission != nil && number != "" {
-		h.Admission.Invalidate(number)
+// invalidateAll drops this process's cached admission answers after a write
+// that may have changed them.
+func invalidateAll(inv Invalidator) {
+	if inv != nil {
+		inv.InvalidateAll()
 	}
 }

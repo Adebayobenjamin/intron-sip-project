@@ -3,11 +3,14 @@ variable "aws_region" {
   description = <<-DESC
     Region for the whole platform.
 
-    eu-central-1 (Frankfurt), chosen because it is the region this account
-    already operates in. Consistency is the reason, and it is a good one: a
-    second region means a second place to look for a VPC endpoint, a second set
-    of AMI IDs, and cross-region data transfer the first time anything talks to
-    something that was already there.
+    eu-west-1 (Ireland). The platform was first built in eu-central-1
+    (Frankfurt) in a different account, then moved here with the move to
+    Intron's own account.
+
+    Ireland also suits the AI leg better. Intron's GPU agent runs in eu-west-2
+    (London), and the agent's audio crosses the internet between that box and
+    our LiveKit server. Dublin to London is a shorter hop than Frankfurt to
+    London.
 
     WHY NOT af-south-1 (Cape Town), despite being far closer to Lagos:
 
@@ -20,17 +23,16 @@ variable "aws_region" {
       3. Price. af-south-1 runs materially above the European regions on both
          compute and data transfer.
 
-    Frankfurt vs Ireland is close to a wash for this workload — both are major
-    interconnect hubs with similar onward paths to West Africa, and the
-    difference is a few milliseconds either way. Not worth optimising against
-    the cost of splitting the account across regions.
+    Frankfurt vs Ireland is close to a wash for the carrier leg — both are
+    major interconnect hubs with similar onward paths to West Africa, and the
+    difference is a few milliseconds either way.
 
-    One-way mouth-to-ear latency from Lagos to Frankfurt lands in the 80-110ms
-    range. That is inside the ITU G.114 budget for a conversation and is what
+    One-way mouth-to-ear latency from Lagos to western Europe lands in the
+    80-110ms range. That is inside the ITU G.114 budget for a conversation and is what
     this architecture is sized against. Revisit if Intron moves to in-country
     termination, where the calculus changes completely.
   DESC
-  default     = "eu-central-1"
+  default     = "eu-west-1"
 }
 
 variable "vpc_cidr" {
@@ -66,5 +68,5 @@ variable "aws_profile" {
     but means any bare `aws` CLI call needs AWS_REGION set. The Makefile
     exports it.
   DESC
-  default     = "klarity_aws"
+  default     = "intron_aws"
 }

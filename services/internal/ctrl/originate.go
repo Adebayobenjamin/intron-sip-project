@@ -145,14 +145,15 @@ func (o *Originator) once(ctx context.Context) bool {
 	)
 
 	dial, err := route.Originate(route.OriginateParams{
-		CallUUID:       req.CallUUID,
-		TenantID:       req.TenantID,
-		PlanID:         req.PlanID,
-		FromDID:        req.FromDID,
-		ToNumber:       req.ToNumber,
-		TrunkHost:      req.TrunkHost,
-		CallbackTarget: o.callbackTarget,
-		EdgeSIPRoute:   o.edgeSIPRoute,
+		CallUUID:        req.CallUUID,
+		TenantID:        req.TenantID,
+		TrafficConfigID: req.TrafficConfigID,
+		FromDID:         req.FromDID,
+		ToNumber:        req.ToNumber,
+		TrunkHost:       req.TrunkHost,
+		TrunkPort:       req.TrunkPort,
+		CallbackTarget:  o.callbackTarget,
+		EdgeSIPRoute:    o.edgeSIPRoute,
 	})
 	if err != nil {
 		o.fail(ctx, log, req.CallUUID, err.Error())

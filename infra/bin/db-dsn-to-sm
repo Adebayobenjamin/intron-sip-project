@@ -47,8 +47,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STACK_DIR="$HERE/../iac/stacks/database/$ENV_NAME"
 [[ -d "$STACK_DIR" ]] || { echo "db-dsn-to-sm: no database stack at $STACK_DIR" >&2; exit 1; }
 
-export AWS_PROFILE="${AWS_PROFILE:-klarity_aws}"
-export AWS_REGION="${AWS_REGION:-eu-central-1}"
+export AWS_PROFILE="${AWS_PROFILE:-intron_aws}"
+export AWS_REGION="${AWS_REGION:-eu-west-1}"
 
 # --- Read the non-secret pieces from Terraform state ----------------------
 

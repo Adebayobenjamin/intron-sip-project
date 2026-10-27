@@ -198,7 +198,7 @@ a gate after each stage, because the failures here are mostly silent.
 
 ### Credentials
 
-Everything authenticates with the **`klarity_aws`** profile, named explicitly
+Everything authenticates with the **`intron_aws`** profile, named explicitly
 rather than inherited from the environment — in every Terraform provider,
 backend and `terraform_remote_state` block, and as `ansible_aws_ssm_profile` in
 the inventory. So a bare `terraform plan` or `ansible-playbook` uses the same
@@ -209,7 +209,7 @@ Three forms, and they differ for a reason:
 | Block | Form | Why |
 |---|---|---|
 | `provider "aws"` | `profile = var.aws_profile` | Overridable per environment |
-| `backend "s3"` | `"klarity_aws"` *(literal)* | Backend blocks **cannot** interpolate |
+| `backend "s3"` | `"intron_aws"` *(literal)* | Backend blocks **cannot** interpolate |
 | `terraform_remote_state` | `profile = var.aws_profile` | Configures its own backend; inherits nothing from the provider |
 
 Miss the third and the provider authenticates fine while a remote_state lookup

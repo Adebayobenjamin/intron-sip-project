@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 765" width="880" height="765"
+     font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>Intron SIP call path</title>
+  <desc>Caller to edge, edge to FreeSWITCH, FreeSWITCH to controller; every outbound leg returns
+    through the edge, which routes it to LiveKit or to the tenant's handoff target.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a8f98"/>
+    </marker>
+    <style>
+      .box   { fill: #ffffff; stroke: #c9c9c9; stroke-width: 1; }
+      .farm  { fill: #e8f0fb; stroke: #3b78d8; stroke-width: 2; }
+      .h     { font-size: 13px; font-weight: 600; fill: #1f2328; }
+      .t     { font-size: 12px; fill: #3d4148; }
+      .m     { font-size: 12px; fill: #7a7f87; }
+      .lbl   { font-size: 11px; fill: #5a5f67; }
+      .flow  { stroke: #8a8f98; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <text x="20" y="30" style="font-size:15px;font-weight:600;fill:#1f2328">
+    The caller stays on the A-leg while the B-leg moves from AI to human
+  </text>
+
+  <!-- VPC -->
+  <rect x="210" y="55" width="660" height="445" rx="8" fill="#f2f2f2" stroke="#c9c9c9"/>
+  <text x="226" y="76" class="m">AWS eu-west-1 — one VPC, 10.70/16</text>
+
+  <!-- Caller -->
+  <rect x="20" y="95" width="150" height="58" rx="6" class="box"/>
+  <text x="95" y="120" class="h" text-anchor="middle">Caller</text>
+  <text x="95" y="139" class="m" text-anchor="middle">PSTN via Twilio</text>
+
+  <!-- Edge -->
+  <rect x="260" y="95" width="280" height="90" rx="6" class="box"/>
+  <text x="274" y="117" class="h">Edge  10.70.0.10 / &lt;EDGE_EIP&gt;</text>
+  <text x="274" y="135" class="t">Kamailio + RTPEngine, SIP and media</text>
+  <text x="274" y="152" class="m">the only thing a carrier addresses</text>
+  <text x="274" y="169" class="m">routes egress on X-Intron-Egress</text>
+
+  <!-- Farm -->
+  <rect x="260" y="255" width="280" height="95" rx="6" class="farm"/>
+  <text x="274" y="277" class="h">Farm  10.70.20.20</text>
+  <text x="274" y="295" class="t">FreeSWITCH, back-to-back UA</text>
+  <text x="274" y="313" class="t">A-leg: the caller, held throughout</text>
+  <text x="274" y="331" class="t">B-leg: re-targeted as the call goes on</text>
+
+  <!-- App -->
+  <rect x="260" y="410" width="280" height="72" rx="6" class="box"/>
+  <text x="274" y="432" class="h">App  10.70.10.10</text>
+  <text x="274" y="450" class="t">esl-controller + control-plane</text>
+  <text x="274" y="467" class="m">admits calls against RDS Postgres</text>
+
+  <!-- LiveKit -->
+  <rect x="620" y="95" width="230" height="90" rx="6" class="box"/>
+  <text x="634" y="117" class="h">LiveKit  10.70.0.30</text>
+  <text x="634" y="135" class="t">livekit-server + livekit-sip</text>
+  <text x="634" y="152" class="m">the room the AI agent joins</text>
+
+  <!-- Handoff targets -->
+  <rect x="210" y="545" width="400" height="205" rx="8" fill="none"
+        stroke="#bdbdbd" stroke-dasharray="5,4"/>
+  <text x="226" y="568" class="t" style="font-weight:600">
+    The tenant's handoff target — resolved by the platform
+  </text>
+
+  <rect x="230" y="580" width="360" height="70" rx="6" class="box"/>
+  <text x="244" y="602" class="h">kind = sip_uri — the client's SBC</text>
+  <text x="244" y="620" class="t">direct SIP, no carrier</text>
+  <text x="244" y="637" class="m">no per-minute cost</text>
+
+  <rect x="230" y="665" width="360" height="72" rx="6" class="box"/>
+  <text x="244" y="687" class="h">kind = e164 — a new outbound call</text>
+  <text x="244" y="705" class="t">over the tenant's trunk → carrier → PSTN</text>
+  <text x="244" y="722" class="m">a second billed leg</text>
+
+  <!-- AI agent -->
+  <rect x="650" y="580" width="200" height="86" rx="6" class="box"/>
+  <text x="664" y="602" class="h">AI agent (Calls05)</text>
+  <text x="664" y="620" class="t">worker + models on a T4</text>
+  <text x="664" y="637" class="m">dials out; no inbound rule</text>
+
+  <!-- 1  caller -> edge -->
+  <line x1="170" y1="118" x2="258" y2="118" class="flow"/>
+  <text x="214" y="110" class="lbl" text-anchor="middle">1</text>
+
+  <!-- 2  edge -> farm -->
+  <line x1="360" y1="185" x2="360" y2="253" class="flow"/>
+  <text x="350" y="223" class="lbl" text-anchor="end">2</text>
+
+  <!-- 4  farm -> edge: every outbound leg -->
+  <line x1="440" y1="255" x2="440" y2="187" class="flow"/>
+  <text x="450" y="223" class="lbl">4  egress</text>
+
+  <!-- 3  farm -> app -->
+  <line x1="360" y1="350" x2="360" y2="408" class="flow"/>
+  <text x="350" y="383" class="lbl" text-anchor="end">3</text>
+
+  <!-- ESL  app -> farm -->
+  <line x1="440" y1="410" x2="440" y2="352" class="flow"/>
+  <text x="450" y="383" class="lbl">ESL</text>
+
+  <!-- 5  edge -> livekit -->
+  <line x1="540" y1="140" x2="618" y2="140" class="flow"/>
+  <text x="580" y="132" class="lbl" text-anchor="middle">5  livekit</text>
+
+  <!-- 6  edge -> handoff target -->
+  <path d="M260,170 H236 V543" class="flow"/>
+  <text x="244" y="524" class="lbl">6  carrier</text>
+
+  <!-- 7  agent connects out to livekit -->
+  <line x1="750" y1="580" x2="750" y2="187" class="flow"/>
+  <text x="760" y="540" class="lbl">7  connects out</text>
+</svg>

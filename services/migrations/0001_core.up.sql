@@ -7,10 +7,31 @@
 -- Conventions, applied throughout:
 --   * text over varchar(n) — Postgres stores them identically and a length
 --     limit here has been wrong more often than it has been useful.
---   * timestamptz, never timestamp. The platform spans Lagos and Frankfurt.
+--   * timestamptz, never timestamp. The platform spans Lagos and Ireland.
 --   * deleted_at for config tables, hard delete for call state.
 --   * every tenant-owned table carries tenant_id, and every query filters on
 --     it.
+--   * phone numbers in blocks are int8 ranges, not strings — see trunks.
+--
+-- RULES THE DATABASE ENFORCES ITSELF. Four, each one a mistake that would
+-- otherwise route a real caller to the wrong place, and each one a race if left
+-- to application code (two requests checking "is this free?" at once both see
+-- yes):
+--
+--   1. no two trunks carry the same number             trunks_numbers_no_overlap
+--   2. no two traffic configs claim the same number
+--      in the same direction                           traffic_configs_numbers_no_overlap
+--   3. a traffic config's numbers lie within its
+--      trunk's, and it belongs to the trunk's tenant   traffic_configs_check()
+--   4. a per-line handoff override belongs to the
+--      same tenant as the line                         handoff_targets_check()
+--
+-- The triggers raise SQLSTATE IN001 with a message written for the API caller;
+-- the store maps that code to 409 and passes the message through.
+
+-- `direction WITH =` inside a GiST exclusion constraint needs a GiST operator
+-- class for text, which is what btree_gist provides. Allowed on RDS.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 -- ---------------------------------------------------------------------------
 -- tenants
@@ -37,8 +58,11 @@ CREATE TABLE tenants (
 );
 
 -- ---------------------------------------------------------------------------
--- trunks
+-- trunks — a carrier connection AND the numbers it carries
 -- ---------------------------------------------------------------------------
+--
+-- tenant_id NULL   the platform trunk: ours, shared, numbers leased to tenants
+-- tenant_id set    the client's own (BYOT): their carrier, their numbers
 --
 -- Trunking is APPLICATION-LAYER. Kamailio holds no carrier configuration at
 -- all: the trunk row supplies the SIP host that goes into the Request-URI, and
@@ -57,9 +81,6 @@ CREATE TABLE trunks (
     slug              text NOT NULL,
     name              text NOT NULL,
 
-    type              text NOT NULL
-                      CHECK (type IN ('inbound', 'outbound', 'bi_directional')),
-
     carrier           text NOT NULL,
 
     -- state is what the carrier relationship is; status is whether we want to
@@ -67,9 +88,6 @@ CREATE TABLE trunks (
     state             text NOT NULL DEFAULT 'disconnected',
     status            text NOT NULL DEFAULT 'inactive'
                       CHECK (status IN ('active', 'inactive')),
-
-    -- The trunk chosen for egress when no per-tenant rule selects another.
-    is_default        boolean NOT NULL DEFAULT false,
 
     sip_host          text,
     sip_port          integer NOT NULL DEFAULT 5060,
@@ -92,6 +110,17 @@ CREATE TABLE trunks (
     signalling_cidrs  text[] NOT NULL DEFAULT '{}',
     media_cidrs       text[] NOT NULL DEFAULT '{}',
 
+    -- THE NUMBER INVENTORY. Every number a carrier can deliver on this trunk,
+    -- as int8 ranges over the digits of the E.164 form (+2348000000100 is
+    -- 2348000000100). Numeric so containment is an index lookup and an overlap
+    -- is something Postgres can refuse; see internal/numrange for the
+    -- conversion and why ranges of mixed length are refused before they get
+    -- here.
+    --
+    -- A number on a trunk is OURS. Whether anything happens when it rings is
+    -- a separate question, answered by traffic_configs.
+    did_ranges        int8multirange NOT NULL DEFAULT '{}',
+
     -- NULL means no agreed concurrency cap, which is where Twilio starts.
     channel_size      integer CHECK (channel_size IS NULL OR channel_size > 0),
 
@@ -107,25 +136,43 @@ CREATE TABLE trunks (
     metadata          jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now(),
-    deleted_at        timestamptz
+    deleted_at        timestamptz,
+
+    -- RULE 1. A number arrives with nothing saying which carrier sent it —
+    -- Kamailio forwards the INVITE and FreeSWITCH sees a dialled number — so
+    -- the number alone has to identify the trunk. Two trunks claiming it would
+    -- make that answer depend on row order.
+    CONSTRAINT trunks_numbers_no_overlap
+        EXCLUDE USING gist (did_ranges WITH &&) WHERE (deleted_at IS NULL)
 );
 
 CREATE UNIQUE INDEX trunks_slug_idx ON trunks (slug) WHERE deleted_at IS NULL;
 CREATE INDEX trunks_tenant_idx ON trunks (tenant_id) WHERE deleted_at IS NULL;
 
--- At most one default trunk. Two would make egress routing depend on row
--- order, which is stable right up until it is not.
-CREATE UNIQUE INDEX trunks_one_default_idx ON trunks ((true))
-    WHERE is_default AND deleted_at IS NULL;
-
 -- ---------------------------------------------------------------------------
--- inbound_plans — what happens to a call once it is admitted
+-- traffic_configs — what happens to a subset of a trunk's numbers
 -- ---------------------------------------------------------------------------
+--
+-- One row is one LINE: these numbers, this direction, this destination, this
+-- recording policy. Each line chooses independently — the client's trunk or
+-- ours, AI or human, inbound or outbound, what is recorded — and nothing
+-- couples those choices.
+--
+-- tenant_id is carried rather than derived from the trunk, because on the
+-- platform trunk the trunk has no tenant: the LINE is what is leased.
 
-CREATE TABLE inbound_plans (
-    id                 text PRIMARY KEY,
+CREATE TABLE traffic_configs (
+    id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id          text NOT NULL REFERENCES tenants(id),
+    trunk_id           bigint NOT NULL REFERENCES trunks(id),
     name               text NOT NULL,
+
+    -- inbound   calls arriving on these numbers
+    -- outbound  calls the platform places presenting one of these numbers
+    direction          text NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+
+    -- Typically a subset of the trunk's. Must lie within them — rule 3.
+    did_ranges         int8multirange NOT NULL,
 
     status             text NOT NULL DEFAULT 'active'
                        CHECK (status IN ('active', 'inactive')),
@@ -133,15 +180,25 @@ CREATE TABLE inbound_plans (
     -- ai       bridge to LiveKit, an agent answers
     -- handoff  straight out to the tenant's contact centre
     -- reject   answer nothing; hang up with a cause
+    --
+    -- For an outbound line this is what the answered customer is connected to.
     destination        text NOT NULL
                        CHECK (destination IN ('ai', 'handoff', 'reject')),
 
-    -- Whether to start record_session before the bridge. Off by default:
-    -- recording clinical conversation audio is a decision someone makes, not
-    -- one they inherit.
-    recording          boolean NOT NULL DEFAULT false,
+    -- none      do not record. The default: recording clinical audio is a
+    --           decision someone makes, not one they inherit
+    -- ai_only   record the AI conversation; stop when a human takes over
+    -- full      record the whole call, handoff included
+    --
+    -- ai_only exists because a caller who consented to talk to a bot has not
+    -- thereby consented to the human conversation that follows being recorded:
+    -- some contact centres record their own side and forbid a second copy,
+    -- some operate under two-party consent, and for clinical audio the human
+    -- half is often the more sensitive one.
+    recording_mode     text NOT NULL DEFAULT 'none'
+                       CHECK (recording_mode IN ('none', 'ai_only', 'full')),
 
-    -- NO BUSINESS HOURS. A plan is open whenever its status is active, and
+    -- NO BUSINESS HOURS. A line is open whenever its status is active, and
     -- closing one is an operator action rather than a schedule. Adding hours
     -- later is a new table plus a nullable column here; it is deliberately not
     -- carried now, because a scheduling feature nobody uses still has to be
@@ -150,87 +207,123 @@ CREATE TABLE inbound_plans (
     metadata           jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at         timestamptz NOT NULL DEFAULT now(),
     updated_at         timestamptz NOT NULL DEFAULT now(),
-    deleted_at         timestamptz
+    deleted_at         timestamptz,
+
+    -- RULE 2. One number, one direction, one answer. Inactive lines still
+    -- count: an inactive line refuses its calls on purpose (403), and letting a
+    -- second line claim the same numbers would make "what happens when this
+    -- rings" depend on which of the two was looked at.
+    CONSTRAINT traffic_configs_numbers_no_overlap
+        EXCLUDE USING gist (direction WITH =, did_ranges WITH &&)
+        WHERE (deleted_at IS NULL),
+
+    CONSTRAINT traffic_configs_not_empty CHECK (NOT isempty(did_ranges))
 );
 
-CREATE INDEX inbound_plans_tenant_idx ON inbound_plans (tenant_id) WHERE deleted_at IS NULL;
+CREATE INDEX traffic_configs_tenant_idx ON traffic_configs (tenant_id) WHERE deleted_at IS NULL;
+CREATE INDEX traffic_configs_trunk_idx ON traffic_configs (trunk_id) WHERE deleted_at IS NULL;
 
--- ---------------------------------------------------------------------------
--- dids — the table the inbound path lives or dies by
--- ---------------------------------------------------------------------------
+-- RULE 3, on the line's side.
 --
--- One lookup settles three things: whether the tenant owns the number
--- (authorisation), what happens to the call (plan), and which trunk it leaves
--- by on egress. Deriving the trunk FROM the DID makes a caller-ID/trunk
--- mismatch unrepresentable rather than merely unlikely — carriers verify that
--- the calling number belongs to the account the call arrives on.
+-- A trigger rather than a CHECK because it reads another table. Both halves of
+-- the rule live here because both are about which trunk a line may sit on:
+-- a line outside its trunk's numbers would admit calls the carrier can never
+-- deliver, and a line on another tenant's BYOT trunk would let one tenant
+-- route calls over another's carrier account.
+CREATE FUNCTION traffic_configs_check() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    t_tenant text;
+    t_ranges int8multirange;
+BEGIN
+    IF NEW.deleted_at IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
 
-CREATE TABLE dids (
-    id          bigserial PRIMARY KEY,
+    SELECT tenant_id, did_ranges INTO t_tenant, t_ranges
+      FROM trunks WHERE id = NEW.trunk_id AND deleted_at IS NULL;
 
-    -- E.164, normalised on write: leading +, digits only. Normalising on write
-    -- rather than on read means the index is usable and two rows cannot
-    -- disagree about what the same number looks like.
-    number      text NOT NULL,
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'trunk % does not exist', NEW.trunk_id
+            USING ERRCODE = 'IN001';
+    END IF;
 
-    tenant_id   text NOT NULL REFERENCES tenants(id),
-    plan_id     text REFERENCES inbound_plans(id),
-    trunk_id    bigint REFERENCES trunks(id),
+    IF t_tenant IS NOT NULL AND t_tenant <> NEW.tenant_id THEN
+        RAISE EXCEPTION 'trunk % belongs to another tenant', NEW.trunk_id
+            USING ERRCODE = 'IN001';
+    END IF;
 
-    status      text NOT NULL DEFAULT 'active'
-                CHECK (status IN ('active', 'inactive')),
+    IF NOT t_ranges @> NEW.did_ranges THEN
+        RAISE EXCEPTION 'did_ranges must lie within the numbers trunk % carries', NEW.trunk_id
+            USING ERRCODE = 'IN001';
+    END IF;
 
-    metadata    jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now(),
-    deleted_at  timestamptz
-);
+    RETURN NEW;
+END;
+$$;
 
--- A number belongs to exactly one tenant. Without this, two tenants can claim
--- the same DID and which one answers depends on row order — a bug that appears
--- as calls occasionally reaching the wrong customer.
-CREATE UNIQUE INDEX dids_number_idx ON dids (number) WHERE deleted_at IS NULL;
-CREATE INDEX dids_tenant_idx ON dids (tenant_id) WHERE deleted_at IS NULL;
+CREATE TRIGGER traffic_configs_check
+    BEFORE INSERT OR UPDATE ON traffic_configs
+    FOR EACH ROW EXECUTE FUNCTION traffic_configs_check();
 
--- ---------------------------------------------------------------------------
--- did_ranges — blocks bought at once
--- ---------------------------------------------------------------------------
---
--- int8range over the numeric form, so containment is an index lookup rather
--- than a scan with string comparison. Stored without the leading + because a
--- range needs a number.
+-- RULE 3, on the trunk's side. Shrinking a trunk's numbers out from under a
+-- line, or deleting the trunk, would leave the line admitting calls on numbers
+-- that no carrier delivers — or, for E.164 handoff, dialling out over a trunk
+-- that no longer exists.
+CREATE FUNCTION trunks_check() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    orphaned bigint;
+BEGIN
+    SELECT id INTO orphaned
+      FROM traffic_configs
+     WHERE trunk_id = NEW.id
+       AND deleted_at IS NULL
+       AND (NEW.deleted_at IS NOT NULL OR NOT NEW.did_ranges @> did_ranges)
+     LIMIT 1;
 
-CREATE TABLE did_ranges (
-    id            bigserial PRIMARY KEY,
-    tenant_id     text NOT NULL REFERENCES tenants(id),
-    plan_id       text REFERENCES inbound_plans(id),
-    trunk_id      bigint REFERENCES trunks(id),
-    number_range  int8range NOT NULL,
-    status        text NOT NULL DEFAULT 'active'
-                  CHECK (status IN ('active', 'inactive')),
-    created_at    timestamptz NOT NULL DEFAULT now(),
-    updated_at    timestamptz NOT NULL DEFAULT now(),
-    deleted_at    timestamptz
-);
+    IF FOUND THEN
+        IF NEW.deleted_at IS NOT NULL THEN
+            RAISE EXCEPTION 'trunk % still has traffic configs (e.g. %); delete or move them first',
+                NEW.id, orphaned USING ERRCODE = 'IN001';
+        END IF;
+        RAISE EXCEPTION 'traffic config % uses numbers this change removes from trunk %',
+            orphaned, NEW.id USING ERRCODE = 'IN001';
+    END IF;
 
-CREATE INDEX did_ranges_range_idx ON did_ranges USING gist (number_range) WHERE deleted_at IS NULL;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trunks_check
+    BEFORE UPDATE OF did_ranges, deleted_at ON trunks
+    FOR EACH ROW EXECUTE FUNCTION trunks_check();
 
 -- ---------------------------------------------------------------------------
 -- handoff_targets — where a call goes when it needs a human
 -- ---------------------------------------------------------------------------
+--
+-- traffic_config_id NULL   part of the tenant's DEFAULT list
+-- traffic_config_id set    an OVERRIDE for that one line
+--
+-- A line with any enabled override uses only its overrides; every other line
+-- uses the tenant default. Overrides replace the default rather than adding to
+-- it, because "this line goes to the Lagos queue" is a statement that the
+-- default queue is the wrong place for it.
 
 CREATE TABLE handoff_targets (
     id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id         text NOT NULL REFERENCES tenants(id),
+    traffic_config_id bigint REFERENCES traffic_configs(id),
     name              text NOT NULL,
 
     -- sip_uri  sip:queue@sbc.client.example — dialled as-is
-    -- e164     +442071234567 — dialled out through the tenant's trunk
+    -- e164     +442071234567 — a NEW outbound call over the line's own trunk
     kind              text NOT NULL CHECK (kind IN ('sip_uri', 'e164')),
     destination       text NOT NULL,
 
     -- Failover order, lowest first. Ties are possible and harmless; the
-    -- ordering below makes them deterministic by id.
+    -- ordering in the query makes them deterministic by id.
     priority          integer NOT NULL DEFAULT 100,
 
     enabled           boolean NOT NULL DEFAULT true,
@@ -243,32 +336,35 @@ CREATE TABLE handoff_targets (
 
 CREATE INDEX handoff_targets_tenant_idx
     ON handoff_targets (tenant_id, priority, id) WHERE deleted_at IS NULL;
+CREATE INDEX handoff_targets_config_idx
+    ON handoff_targets (traffic_config_id) WHERE deleted_at IS NULL AND traffic_config_id IS NOT NULL;
 
--- ---------------------------------------------------------------------------
--- agent_configs — what the AI leg is handed, per plan
--- ---------------------------------------------------------------------------
+-- RULE 4. An override pointing at another tenant's line would put one tenant's
+-- human on another tenant's calls.
+CREATE FUNCTION handoff_targets_check() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.traffic_config_id IS NULL OR NEW.deleted_at IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
 
-CREATE TABLE agent_configs (
-    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id       text NOT NULL REFERENCES tenants(id),
-    plan_id         text NOT NULL REFERENCES inbound_plans(id),
+    PERFORM 1 FROM traffic_configs
+     WHERE id = NEW.traffic_config_id
+       AND tenant_id = NEW.tenant_id
+       AND deleted_at IS NULL;
 
-    -- Template for the LiveKit room name. Interpolated per call; the default
-    -- is the channel UUID, which is unique and already exists.
-    room_template   text NOT NULL DEFAULT '{call_uuid}',
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'traffic config % does not exist for this tenant', NEW.traffic_config_id
+            USING ERRCODE = 'IN001';
+    END IF;
 
-    agent_identity  text NOT NULL,
+    RETURN NEW;
+END;
+$$;
 
-    -- Handed to the agent as room metadata. Merged with per-call facts
-    -- (caller, DID, tenant) at room creation.
-    metadata        jsonb NOT NULL DEFAULT '{}'::jsonb,
-
-    created_at      timestamptz NOT NULL DEFAULT now(),
-    updated_at      timestamptz NOT NULL DEFAULT now(),
-    deleted_at      timestamptz
-);
-
-CREATE UNIQUE INDEX agent_configs_plan_idx ON agent_configs (plan_id) WHERE deleted_at IS NULL;
+CREATE TRIGGER handoff_targets_check
+    BEFORE INSERT OR UPDATE ON handoff_targets
+    FOR EACH ROW EXECUTE FUNCTION handoff_targets_check();
 
 -- ---------------------------------------------------------------------------
 -- api_keys — machine tokens
@@ -305,40 +401,53 @@ CREATE UNIQUE INDEX api_keys_hash_idx ON api_keys (token_hash);
 -- Hard delete, not soft: a row exists only while the call does. The history
 -- lives in call_history.
 --
--- The claim is a CONDITIONAL INSERT counting rows for the tenant in the same
--- statement. Reading the count and then inserting is a race that lets two
--- simultaneous calls both pass a cap of one.
+-- The claim serialises per tenant with an advisory lock and then inserts if
+-- the count is under the cap; see store.ClaimCall for why the one-statement
+-- version of that is a race.
 
 CREATE TABLE calls (
-    call_uuid     text PRIMARY KEY,
-    tenant_id     text NOT NULL REFERENCES tenants(id),
-    plan_id       text REFERENCES inbound_plans(id),
-    trunk_id      bigint REFERENCES trunks(id),
+    call_uuid         text PRIMARY KEY,
+    tenant_id         text NOT NULL REFERENCES tenants(id),
+    traffic_config_id bigint REFERENCES traffic_configs(id),
 
-    direction     text NOT NULL CHECK (direction IN ('inbound', 'outbound')),
-    did           text,
-    caller        text,
-    callee        text,
+    -- The trunk the call arrived on, or leaves by. An E.164 handoff dials out
+    -- over THIS trunk — the line's own carrier — which is why it is read from
+    -- the call rather than looked up from the tenant.
+    trunk_id          bigint REFERENCES trunks(id),
 
-    state         text NOT NULL DEFAULT 'ringing'
-                  CHECK (state IN ('ringing', 'answered', 'bridged', 'handoff')),
+    direction         text NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+    did               text,
+    caller            text,
+    callee            text,
+
+    state             text NOT NULL DEFAULT 'ringing'
+                      CHECK (state IN ('ringing', 'answered', 'bridged', 'handoff')),
+
+    -- SNAPSHOTTED from the line when the call starts, not re-read later. A
+    -- transferred leg re-enters the dialplan and has to decide whether to keep
+    -- recording; reading the line again at that moment would let an operator
+    -- editing it mid-call change the policy of a conversation in progress —
+    -- impossible to reconstruct afterwards when someone asks why half a call
+    -- was recorded. The policy in force at the start governs the whole call.
+    recording_mode    text NOT NULL DEFAULT 'none'
+                      CHECK (recording_mode IN ('none', 'ai_only', 'full')),
 
     -- Which app instance holds the ESL socket. With app_count = 1 this is
     -- decoration; it stops being decoration the moment there are two.
-    node          text,
+    node              text,
 
-    livekit_room  text,
+    livekit_room      text,
 
-    started_at    timestamptz NOT NULL DEFAULT now(),
-    answered_at   timestamptz,
+    started_at        timestamptz NOT NULL DEFAULT now(),
+    answered_at       timestamptz,
 
     -- A crashed controller leaves its rows claimed with nobody holding the
     -- calls, and the tenant's capacity silently drops. The sweeper deletes
     -- anything not touched in five minutes; without it, one crash permanently
     -- reduces capacity and nothing says why.
-    heartbeat_at  timestamptz NOT NULL DEFAULT now(),
+    heartbeat_at      timestamptz NOT NULL DEFAULT now(),
 
-    metadata      jsonb NOT NULL DEFAULT '{}'::jsonb
+    metadata          jsonb NOT NULL DEFAULT '{}'::jsonb
 );
 
 -- The index the cap check runs against, on every single inbound call.
@@ -352,6 +461,9 @@ CREATE INDEX calls_heartbeat_idx ON calls (heartbeat_at);
 -- Written in the same transaction that releases the concurrency slot, so the
 -- two cannot disagree. Columns are fixed generously here because backfilling a
 -- CDR column after the calls have happened is not possible.
+--
+-- No foreign keys: history outlives the configuration it describes, and a
+-- deleted line must not take its call records with it.
 
 CREATE TABLE call_history (
     id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -369,9 +481,13 @@ CREATE TABLE call_history (
     callee            text,
 
     trunk_id          bigint,
-    plan_id           text,
+    traffic_config_id bigint,
     handoff_target_id bigint,
     livekit_room      text,
+
+    -- The policy the call ran under, so a recording that is or is not there
+    -- can be explained without reconstructing what the line said at the time.
+    recording_mode    text,
 
     node              text,
 
@@ -413,28 +529,30 @@ CREATE INDEX call_history_tenant_time_idx ON call_history (tenant_id, invite_at 
 -- request would not.
 
 CREATE TABLE originate_requests (
-    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    call_uuid     text NOT NULL UNIQUE,
+    id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    call_uuid         text NOT NULL UNIQUE,
 
-    tenant_id     text NOT NULL REFERENCES tenants(id),
-    plan_id       text REFERENCES inbound_plans(id),
+    tenant_id         text NOT NULL REFERENCES tenants(id),
 
-    -- The DID this call presents. Validated as owned-and-active before the row
-    -- is written; the trunk comes from the same dids row.
-    from_did      text NOT NULL,
-    to_number     text NOT NULL,
-    trunk_id      bigint REFERENCES trunks(id),
+    -- The OUTBOUND line whose numbers include from_did. Found from the number
+    -- before the row is written, and it supplies the trunk — so the caller ID
+    -- and the carrier the call leaves by cannot disagree.
+    traffic_config_id bigint REFERENCES traffic_configs(id),
 
-    status        text NOT NULL DEFAULT 'pending'
-                  CHECK (status IN ('pending', 'claimed', 'placed', 'failed')),
+    from_did          text NOT NULL,
+    to_number         text NOT NULL,
+    trunk_id          bigint REFERENCES trunks(id),
 
-    claimed_by    text,
-    claimed_at    timestamptz,
-    error         text,
+    status            text NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending', 'claimed', 'placed', 'failed')),
 
-    metadata      jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at    timestamptz NOT NULL DEFAULT now(),
-    updated_at    timestamptz NOT NULL DEFAULT now()
+    claimed_by        text,
+    claimed_at        timestamptz,
+    error             text,
+
+    metadata          jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now()
 );
 
 -- Partial: the claim query only ever looks at pending rows, and this keeps the

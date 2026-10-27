@@ -20,15 +20,15 @@ import (
 
 // Deps is everything the API needs.
 type Deps struct {
-	Auth      *auth.Authenticator
-	Config    handlers.ConfigHandler
-	Route     handlers.Route
-	Trunks    handlers.TrunksHandler
-	Drift     handlers.DriftHandler
-	Originate handlers.OriginateHandler
-	Keys      handlers.KeysHandler
-	Calls     handlers.CallsHandler
-	Log       *slog.Logger
+	Auth           *auth.Authenticator
+	Config         handlers.ConfigHandler
+	Route          handlers.Route
+	TrafficConfigs handlers.TrafficConfigsHandler
+	Trunks         handlers.TrunksHandler
+	Originate      handlers.OriginateHandler
+	Keys           handlers.KeysHandler
+	Calls          handlers.CallsHandler
+	Log            *slog.Logger
 }
 
 // New builds the API mux.
@@ -62,17 +62,15 @@ func New(d Deps) http.Handler {
 	write("PATCH", "/v1/tenants/{id}", d.Config.UpdateTenant)
 	write("DELETE", "/v1/tenants/{id}", d.Config.DeleteTenant)
 
-	// Plans
-	get("/v1/plans", d.Config.ListPlans)
-	write("POST", "/v1/plans", d.Config.CreatePlan)
-	write("PATCH", "/v1/plans/{id}", d.Config.UpdatePlan)
-	write("DELETE", "/v1/plans/{id}", d.Config.DeletePlan)
+	// Traffic configs — lines: a trunk's numbers, a direction, a destination,
+	// a recording policy.
+	get("/v1/traffic-configs", d.TrafficConfigs.List)
+	write("POST", "/v1/traffic-configs", d.TrafficConfigs.Create)
+	write("PATCH", "/v1/traffic-configs/{id}", d.TrafficConfigs.Update)
+	write("DELETE", "/v1/traffic-configs/{id}", d.TrafficConfigs.Delete)
 
-	// DIDs
-	get("/v1/dids", d.Config.ListDIDs)
-	write("POST", "/v1/dids", d.Config.CreateDID)
-	write("PATCH", "/v1/dids/{id}", d.Config.UpdateDID)
-	write("DELETE", "/v1/dids/{id}", d.Config.DeleteDID)
+	// One number: which trunk carries it, which line handles it each way.
+	get("/v1/numbers/{e164}", d.TrafficConfigs.Number)
 
 	// Trunks
 	get("/v1/trunks", d.Trunks.ListTrunks)
@@ -80,9 +78,8 @@ func New(d Deps) http.Handler {
 	write("PATCH", "/v1/trunks/{id}", d.Trunks.UpdateTrunk)
 	write("DELETE", "/v1/trunks/{id}", d.Trunks.DeleteTrunk)
 
-	// What Twilio has, against what we expect. The thing to curl when calls
-	// are not arriving, before anyone starts reading SIP traces.
-	get("/v1/trunks/{id}/drift", d.Drift.Check)
+	// How a trunk's numbers are divided among lines, and which are uncovered.
+	get("/v1/trunks/{id}/coverage", d.TrafficConfigs.Coverage)
 
 	// Handoff targets
 	get("/v1/handoff-targets", d.Trunks.ListHandoffTargets)

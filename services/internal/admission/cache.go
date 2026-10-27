@@ -154,6 +154,12 @@ func (c *cache) drop(number string) {
 	delete(c.entries, number)
 }
 
+func (c *cache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]entry)
+}
+
 // evictExpiredLocked removes entries past their stale window. Anything inside
 // it is still useful — that is the entry that keeps calls routing when the
 // database is down — so expiry alone is not grounds for eviction.

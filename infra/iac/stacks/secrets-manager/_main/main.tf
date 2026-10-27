@@ -142,14 +142,14 @@ locals {
         Control-plane REST API runtime config + secrets.
 
         Expected keys:
-          DATABASE_URL              Postgres DSN (RDS; the data tier is built
-                                    but empty today)
+          DATABASE_URL              Postgres DSN. Written by bin/db-dsn-to-sm,
+                                    which merges it in
           CONTROL_PLANE_API_TOKEN   operator/API callers only. NOT presented by
-                                    Kamailio or the ESL controller any more -
-                                    neither calls this API
-          JWT_SIGNING_KEY           for operator/API auth
-          TWILIO_ACCOUNT_SID        Elastic SIP trunk management for the POC
-          TWILIO_AUTH_TOKEN
+                                    Kamailio or the ESL controller - neither
+                                    calls this API
+
+        No JWT_SIGNING_KEY (nothing signs a token) and no carrier credentials
+        (the control plane calls no carrier's API).
       DESC
     }
 

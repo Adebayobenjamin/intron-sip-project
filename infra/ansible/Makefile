@@ -1,6 +1,6 @@
 # ansible/Makefile — drive playbooks against SSM-only EC2 hosts.
 #
-# Parallels iac/Makefile, including how it authenticates: the klarity_aws
+# Parallels iac/Makefile, including how it authenticates: the intron_aws
 # shared-config profile, named explicitly rather than inherited from whatever
 # AWS_PROFILE happens to be set.
 #
@@ -20,23 +20,23 @@ ENV          ?= beta
 TAGS         ?=
 LIMIT        ?=
 EXTRA_VARS   ?=
-AWS_REGION   ?= eu-central-1
+AWS_REGION   ?= eu-west-1
 
 ########################################################
-# CREDENTIALS - the klarity_aws profile, same as Terraform.
+# CREDENTIALS - the intron_aws profile, same as Terraform.
 #
 # Ansible does not depend on this being exported: the inventory sets
 # ansible_aws_ssm_profile, so a bare `ansible-playbook` authenticates the same
 # way a `make play` does. It is exported anyway for the plain `aws` calls in
 # the recipes below, which have no inventory to read.
 #
-# AWS_REGION is NOT optional: the klarity_aws profile carries no region in
+# AWS_REGION is NOT optional: the intron_aws profile carries no region in
 # ~/.aws/config, so without it every CLI call fails with NoRegion.
 #
 # NO MFA WRAPPER. This used to route every target through bin/with-mfa, now
 # deleted. Two reasons it is gone. It is incompatible with naming a profile - an explicit
 # profile beats environment credentials, so the MFA session would be silently
-# ignored while appearing to be in use. And the identity behind klarity_aws has
+# ignored while appearing to be in use. And the identity behind intron_aws has
 # NO MFA DEVICE (checked with `aws iam list-mfa-devices`), so GetSessionToken
 # could never have succeeded; the placeholder MFA_ARN meant every target here
 # failed before Ansible started.
@@ -45,7 +45,7 @@ AWS_REGION   ?= eu-central-1
 # assume-role profile with `mfa_serial` makes the SDK prompt and cache the
 # session itself.
 ########################################################
-AWS_PROFILE  ?= klarity_aws
+AWS_PROFILE  ?= intron_aws
 
 BIN_DIR  := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../bin)
 

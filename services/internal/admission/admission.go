@@ -51,13 +51,20 @@ import (
 type Reason string
 
 const (
-	ReasonOK              Reason = "ok"
-	ReasonUnknownDID      Reason = "unknown_did"
-	ReasonDIDInactive     Reason = "did_inactive"
-	ReasonNoPlan          Reason = "no_plan"
-	ReasonPlanInactive    Reason = "plan_inactive"
-	ReasonTenantSuspended Reason = "tenant_suspended"
-	ReasonPlanRejects     Reason = "plan_rejects"
+	ReasonOK Reason = "ok"
+
+	// ReasonUnknownDID means no trunk carries the number. It is not ours.
+	ReasonUnknownDID Reason = "unknown_did"
+
+	// ReasonNoTrafficConfig means a trunk carries the number but no inbound
+	// line covers it: ours, with nothing configured behind it.
+	ReasonNoTrafficConfig Reason = "no_traffic_config"
+
+	ReasonTrafficConfigInactive Reason = "traffic_config_inactive"
+	ReasonTenantSuspended       Reason = "tenant_suspended"
+
+	// ReasonTrafficConfigRejects means the line is configured to refuse.
+	ReasonTrafficConfigRejects Reason = "traffic_config_rejects"
 
 	// ReasonOverCapacity is NOT produced here. The concurrency cap is enforced
 	// by the conditional insert that claims a slot, because checking a count
@@ -79,17 +86,39 @@ const (
 	DestinationReject  Destination = "reject"
 )
 
-// Verdict is the whole answer. It carries the plan, not two opaque ids: the
-// controller needs the plan config regardless, and resolving it in the same
+// RecordingMode is a line's recording policy. See traffic_configs in
+// migrations/0001_core.up.sql for why the middle value exists.
+type RecordingMode string
+
+const (
+	RecordingNone   RecordingMode = "none"
+	RecordingAIOnly RecordingMode = "ai_only"
+	RecordingFull   RecordingMode = "full"
+)
+
+// Valid reports whether m is one of the three modes.
+func (m RecordingMode) Valid() bool {
+	switch m {
+	case RecordingNone, RecordingAIOnly, RecordingFull:
+		return true
+	}
+	return false
+}
+
+// Verdict is the whole answer. It carries the line's configuration, not an
+// opaque id: the controller needs it regardless, and resolving it in the same
 // pass is one query rather than two.
 type Verdict struct {
-	Admitted    bool
-	Reason      Reason
-	TenantID    string
-	PlanID      string
-	Destination Destination
-	Recording   bool
-	TrunkID     int64
+	Admitted        bool
+	Reason          Reason
+	TenantID        string
+	TrafficConfigID int64
+	Destination     Destination
+	RecordingMode   RecordingMode
+
+	// TrunkID is the trunk that carries the number — the one the call arrived
+	// on, and the one an E.164 handoff leaves by.
+	TrunkID int64
 
 	// Stale reports that this answer came from an expired cache entry because
 	// the database could not be reached. The call proceeds; the log should say
@@ -100,19 +129,23 @@ type Verdict struct {
 
 // Route is the raw configuration a number resolves to, before any policy is
 // applied. It is what gets cached.
+//
+// TenantID comes from the line when there is one, and from the trunk when
+// there is not: on a client's own trunk the number is the client's even with
+// no line configured, while on the platform trunk an unconfigured number
+// belongs to nobody yet.
 type Route struct {
-	Number       string
-	TenantID     string
-	TenantActive bool
-	DIDActive    bool
-	PlanID       string
-	PlanActive   bool
-	Destination  Destination
-	Recording    bool
-	TrunkID      int64
+	Number          string
+	TenantID        string
+	TenantActive    bool
+	TrafficConfigID int64
+	ConfigActive    bool
+	Destination     Destination
+	RecordingMode   RecordingMode
+	TrunkID         int64
 }
 
-// ErrNotFound means no DID and no range matched. It is an ordinary outcome —
+// ErrNotFound means no trunk carries the number. It is an ordinary outcome —
 // most of the numbers a carrier can deliver are not ours — and is cached.
 var ErrNotFound = errors.New("admission: no route for number")
 
@@ -186,32 +219,30 @@ func (s *Service) Resolve(ctx context.Context, did string) (Verdict, error) {
 //
 // Order matters, and it runs cheapest-and-most-specific first so the reason
 // recorded on the CDR is the most useful one available. A suspended tenant
-// whose plan is also inactive should read as suspended: that is the fact
+// whose line is also inactive should read as suspended: that is the fact
 // someone needs.
 func evaluate(r Route) Verdict {
 	v := Verdict{
-		TenantID:    r.TenantID,
-		PlanID:      r.PlanID,
-		Destination: r.Destination,
-		Recording:   r.Recording,
-		TrunkID:     r.TrunkID,
+		TenantID:        r.TenantID,
+		TrafficConfigID: r.TrafficConfigID,
+		Destination:     r.Destination,
+		RecordingMode:   r.RecordingMode,
+		TrunkID:         r.TrunkID,
 	}
 
 	switch {
-	case !r.TenantActive:
+	case r.TenantID != "" && !r.TenantActive:
 		v.Reason = ReasonTenantSuspended
-	case !r.DIDActive:
-		v.Reason = ReasonDIDInactive
-	case r.PlanID == "":
-		// A DID that resolves to a tenant but no plan. The number is ours and
-		// nobody has said what to do with it — distinct from an unknown
-		// number, and the fix is different.
-		v.Reason = ReasonNoPlan
-	case !r.PlanActive:
-		v.Reason = ReasonPlanInactive
+	case r.TrafficConfigID == 0:
+		// A trunk carries the number and no inbound line covers it. The
+		// number is ours and nobody has said what to do with it — distinct
+		// from an unknown number, and the fix is different.
+		v.Reason = ReasonNoTrafficConfig
+	case !r.ConfigActive:
+		v.Reason = ReasonTrafficConfigInactive
 	case r.Destination == DestinationReject:
 		// Configured to refuse. Not a fault; someone chose this.
-		v.Reason = ReasonPlanRejects
+		v.Reason = ReasonTrafficConfigRejects
 	default:
 		v.Admitted = true
 		v.Reason = ReasonOK
@@ -288,4 +319,11 @@ func (s *Service) CacheSize() int {
 // this design accepts.
 func (s *Service) Invalidate(number string) {
 	s.cache.drop(Normalise(number))
+}
+
+// InvalidateAll drops every cached answer. For the control plane after a
+// change to a trunk or a line, which moves whole blocks of numbers at once.
+// Same caveat as Invalidate: the controller's cache is untouched.
+func (s *Service) InvalidateAll() {
+	s.cache.clear()
 }

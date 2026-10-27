@@ -1,7 +1,7 @@
 variable "aws_region" {
   type        = string
   description = "Region the state bucket lives in. Must match the `region` in every other stack's backend block."
-  default     = "eu-central-1"
+  default     = "eu-west-1"
 }
 
 variable "environment" {
@@ -20,7 +20,7 @@ variable "state_bucket_name" {
     A per-env bucket would mean a second bootstrap for every new environment
     and buys nothing — the blast radius of the bucket is the account either way.
   DESC
-  default     = "intron-sip-tfstate-eu-central-1"
+  default     = "intron-sip-tfstate-eu-west-1"
 }
 
 variable "aws_profile" {
@@ -50,5 +50,5 @@ variable "aws_profile" {
     Terraform — region comes from var.aws_region — but means any bare `aws` CLI
     call needs AWS_REGION set. The Makefile exports it.
   DESC
-  default     = "klarity_aws"
+  default     = "intron_aws"
 }

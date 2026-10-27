@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/Adebayobenjamin/intron-sip-project/services/internal/admission"
@@ -23,7 +24,7 @@ const (
 	causeUnallocated = "UNALLOCATED_NUMBER"
 
 	// causeRejected → SIP 403. The number IS ours and we are refusing:
-	// suspended tenant, inactive plan, a plan configured to refuse.
+	// suspended tenant, inactive line, a line configured to refuse.
 	causeRejected = "CALL_REJECTED"
 
 	// causeCongestion → SIP 503. At capacity. Distinct from a fault because a
@@ -31,7 +32,7 @@ const (
 	causeCongestion = "NORMAL_CIRCUIT_CONGESTION"
 
 	// causeTemporary → SIP 503. Our fault: the database was unreachable, or
-	// the number is provisioned with nothing configured behind it.
+	// the number is on a trunk with no line configured behind it.
 	causeTemporary = "NORMAL_TEMPORARY_FAILURE"
 )
 
@@ -147,18 +148,25 @@ func (l *Listener) handle(ctx context.Context, rawConn net.Conn) {
 	}
 	defer func() { l.finish(ctx, log, &rec) }()
 
-	// OUTBOUND calls take a different route to a verdict.
-	//
-	// There is no dialled DID to resolve: the number in the Request-URI is the
-	// customer's, not one we own. The tenant and plan come from the channel
-	// variables the originate set — which this service wrote itself, so they
-	// are trustworthy in a way a header from the network never is.
-	outbound := ch.Direction == "outbound" || ch.IntronDirection == "outbound"
-
 	// A TRANSFERRED leg dials the reserved word rather than a number, and is
 	// neither an ordinary inbound call nor an outbound one. See
 	// transferVerdict for why it cannot go through admission.
-	transferred := !outbound && IsTransferDestination(ch.DestinationNumber)
+	//
+	// CHECKED FIRST, WHATEVER THE DIRECTION. A transferred OUTBOUND call still
+	// carries intron_direction=outbound on its channel; checking direction
+	// first classed it as outbound, skipped this, and sent the customer back
+	// to the AI agent that had just asked for a human. Seen on the first
+	// outbound handoff in beta: REFER, then a fresh bridge to LiveKit.
+	transferred := IsTransferDestination(ch.DestinationNumber)
+
+	// OUTBOUND calls take a different route to a verdict.
+	//
+	// There is no dialled DID to resolve: the number in the Request-URI is the
+	// customer's, not one we own. The tenant and line come from the channel
+	// variables the originate set and the slot the control plane claimed —
+	// both written by this platform, so they are trustworthy in a way a header
+	// from the network never is.
+	outbound := !transferred && (ch.Direction == "outbound" || ch.IntronDirection == "outbound")
 
 	var verdict admission.Verdict
 	switch {
@@ -199,8 +207,9 @@ func (l *Listener) handle(ctx context.Context, rawConn net.Conn) {
 	}
 
 	rec.TenantID = verdict.TenantID
-	rec.PlanID = verdict.PlanID
+	rec.TrafficConfigID = verdict.TrafficConfigID
 	rec.TrunkID = verdict.TrunkID
+	rec.RecordingMode = string(verdict.RecordingMode)
 	rec.Outcome = string(verdict.Reason)
 
 	if !verdict.Admitted {
@@ -209,11 +218,17 @@ func (l *Listener) handle(ctx context.Context, rawConn net.Conn) {
 		return
 	}
 
+	// Decided once, from the mode snapshotted when the call started. See
+	// recordingActionFor for why a transferred leg has to stop the recording
+	// rather than merely not start one.
+	recording := recordingActionFor(verdict.RecordingMode, verdict.Destination, transferred)
+
 	log.Info("call admitted",
 		"tenant", verdict.TenantID,
-		"plan", verdict.PlanID,
+		"traffic_config", verdict.TrafficConfigID,
 		"destination", string(verdict.Destination),
-		"recording", verdict.Recording,
+		"recording_mode", string(verdict.RecordingMode),
+		"recording_action", recording.String(),
 		"stale_config", verdict.Stale)
 
 	// An outbound call already holds its slot: the control plane claimed one
@@ -223,24 +238,37 @@ func (l *Listener) handle(ctx context.Context, rawConn net.Conn) {
 		stopBeat := l.heartbeat(ctx, ch.UUID, log)
 		defer stopBeat()
 
-		platformHungUp := l.connect(ctx, conn, log, &rec, ch, verdict, watcher)
+		platformHungUp := l.connect(ctx, conn, log, &rec, ch, verdict, recording, watcher)
 		info := watcher.wait(l.cfg.hangupWait())
 		info.apply(&rec, platformHungUp)
+
+		// The same transfer watch as an inbound call. Without it a handoff
+		// ended this leg's record at the transfer and released the slot while
+		// the customer was still talking to a human — see the inbound path
+		// below for the full reasoning.
+		if l.wasTransferred(ctx, log, ch.UUID, info.Seen) {
+			l.watchTransferred(ctx, log, &rec, ch.UUID)
+		}
 		return
 	}
 
 	// Take the slot BEFORE anything that costs money or media. The cap is
 	// enforced by the database, not by a count read here — see
 	// store.ClaimCall for why the obvious version of that is a race.
+	//
+	// The recording mode is SNAPSHOTTED here. A transferred leg reads it back
+	// from this row rather than from the line, so an edit mid-call cannot
+	// change the policy of a conversation already in progress.
 	claim := calls.Claim{
-		UUID:      ch.UUID,
-		TenantID:  verdict.TenantID,
-		PlanID:    verdict.PlanID,
-		TrunkID:   verdict.TrunkID,
-		Direction: rec.Direction,
-		DID:       rec.DID,
-		Caller:    ch.Caller,
-		Node:      rec.Node,
+		UUID:            ch.UUID,
+		TenantID:        verdict.TenantID,
+		TrafficConfigID: verdict.TrafficConfigID,
+		TrunkID:         verdict.TrunkID,
+		Direction:       rec.Direction,
+		DID:             rec.DID,
+		Caller:          ch.Caller,
+		Node:            rec.Node,
+		RecordingMode:   string(verdict.RecordingMode),
 	}
 
 	if err := l.ledger.ClaimCall(ctx, claim); err != nil {
@@ -272,7 +300,7 @@ func (l *Listener) handle(ctx context.Context, rawConn net.Conn) {
 	// Returns when the bridge has actually ended, not when it started — so
 	// everything below runs at the end of the call rather than two seconds
 	// into it. See the note on the select in connect().
-	platformHungUp := l.connect(ctx, conn, log, &rec, ch, verdict, watcher)
+	platformHungUp := l.connect(ctx, conn, log, &rec, ch, verdict, recording, watcher)
 
 	// Wait for CHANNEL_HANGUP_COMPLETE, which is the event carrying the
 	// populated CDR variables. Whatever it reports beats what this service
@@ -418,39 +446,66 @@ func directionOf(ch esl.ChannelData) string {
 // outboundVerdict builds a verdict for a call this service placed.
 //
 // No admission lookup: the number dialled belongs to the customer, not to us,
-// so resolving it as a DID would correctly find nothing and refuse a call we
-// asked for. The tenant and plan are read off the channel variables the
-// originate set — written by this service, not supplied by the network.
+// so resolving it would correctly find nothing and refuse a call we asked for.
+//
+// Two sources, both written by this platform rather than supplied by the
+// network:
+//
+//	the live row     the control plane claimed it when the call was queued:
+//	                 the trunk, and the recording mode SNAPSHOTTED at that moment
+//	the line         what to connect the answered customer to
 func (l *Listener) outboundVerdict(ctx context.Context, log *slog.Logger, ch esl.ChannelData) admission.Verdict {
 	v := admission.Verdict{
 		Admitted: true,
 		Reason:   admission.ReasonOK,
 		TenantID: ch.Tenant,
-		PlanID:   ch.Plan,
 
-		// Default for an outbound call with no plan: put the customer with the
-		// AI agent, which is what an outbound campaign is for. A plan that
-		// says otherwise overrides it below.
-		Destination: admission.DestinationAI,
+		// Defaults for a call whose line cannot be read: put the customer
+		// with the AI agent, which is what an outbound campaign is for, and
+		// record nothing — recording is not something to guess at on a call
+		// that is already connected.
+		Destination:   admission.DestinationAI,
+		RecordingMode: admission.RecordingNone,
 	}
 
-	if ch.Plan == "" {
-		log.Info("outbound call with no plan; defaulting to the AI leg")
+	v.TrafficConfigID, _ = strconv.ParseInt(ch.TrafficConfig, 10, 64)
+
+	snapshot := false
+	if l.live != nil {
+		live, err := l.live.LiveCall(ctx, ch.UUID)
+		switch {
+		case err == nil:
+			v.TrunkID = live.TrunkID
+			v.RecordingMode = admission.RecordingMode(live.RecordingMode)
+			if v.TrafficConfigID == 0 {
+				v.TrafficConfigID = live.TrafficConfigID
+			}
+			snapshot = true
+		default:
+			log.Warn("could not read the slot claimed for this outbound call; "+
+				"falling back to the line's current settings", "error", err)
+		}
+	}
+
+	if v.TrafficConfigID == 0 {
+		log.Info("outbound call with no line; defaulting to the AI leg, unrecorded")
 		return v
 	}
 
-	// A plan was named, so its configuration decides what happens — including
-	// whether to record, which is not something to guess at on a call that is
-	// already connected.
-	plan, err := l.routes.PlanByID(ctx, ch.Plan)
+	line, err := l.routes.TrafficConfigByID(ctx, v.TrafficConfigID)
 	if err != nil {
-		log.Warn("could not load the plan for an outbound call; using defaults",
-			"plan", ch.Plan, "error", err)
+		log.Warn("could not load the line for an outbound call; using defaults",
+			"traffic_config", v.TrafficConfigID, "error", err)
 		return v
 	}
 
-	v.Destination = admission.Destination(plan.Destination)
-	v.Recording = plan.Recording
+	v.Destination = admission.Destination(line.Destination)
+	if v.TrunkID == 0 {
+		v.TrunkID = line.TrunkID
+	}
+	if !snapshot {
+		v.RecordingMode = admission.RecordingMode(line.RecordingMode)
+	}
 	return v
 }
 
@@ -496,14 +551,14 @@ func (l *Listener) decide(ctx context.Context, log *slog.Logger, ch esl.ChannelD
 // causeFor maps a refusal to the cause the carrier sees.
 func causeFor(reason admission.Reason) string {
 	switch reason {
-	case admission.ReasonUnknownDID, admission.ReasonDIDInactive:
-		// Not ours, or withdrawn. 404 is the honest answer and it is what
-		// stops a carrier retrying.
+	case admission.ReasonUnknownDID:
+		// Not ours. 404 is the honest answer and it is what stops a carrier
+		// retrying.
 		return causeUnallocated
 
 	case admission.ReasonTenantSuspended,
-		admission.ReasonPlanInactive,
-		admission.ReasonPlanRejects:
+		admission.ReasonTrafficConfigInactive,
+		admission.ReasonTrafficConfigRejects:
 		// Ours, and we are refusing on purpose. 403, not 404 — the number
 		// exists, and telling a carrier otherwise invites it to be
 		// reallocated.
@@ -512,8 +567,8 @@ func causeFor(reason admission.Reason) string {
 	case admission.ReasonOverCapacity:
 		return causeCongestion
 
-	case admission.ReasonNoPlan:
-		// Provisioned with nothing behind it. OUR misconfiguration, not the
+	case admission.ReasonNoTrafficConfig:
+		// On a trunk with no line behind it. OUR misconfiguration, not the
 		// caller's problem, so a temporary failure rather than 404 — the
 		// number does exist and will work once someone finishes setting it up.
 		return causeTemporary

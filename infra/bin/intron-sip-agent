@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+#
+# intron-sip-agent — deploy and operate the SIP platform's AI agent on
+# Intron's GPU box (Calls05).
+#
+# Runs on an OPERATOR LAPTOP. It copies agent/ to the box over SSH and manages
+# one systemd unit there. The agent itself is described in
+# agent/intron_sip_agent.py.
+#
+# USAGE
+#   infra/bin/intron-sip-agent deploy      copy, configure, (re)start, wait until registered
+#   infra/bin/intron-sip-agent status      unit state and recent log
+#   infra/bin/intron-sip-agent logs        follow the log
+#   infra/bin/intron-sip-agent restart
+#   infra/bin/intron-sip-agent uninstall   remove everything this created
+#
+# ENVIRONMENT
+#   AGENT_HOST       ssh target              default ubuntu@3.11.207.6
+#   AGENT_SSH_KEY    ssh identity            default ~/.ssh/intron-voicebot-deploy-2026.pem
+#   ENV_NAME         platform environment    default beta
+#   AWS_PROFILE / AWS_REGION                 default intron_aws / eu-west-1
+#
+# WHAT IT CREATES ON THE BOX, ALL REMOVABLE
+#   /opt/intron-sip-agent/                the agent, its prompt, its run script
+#   /opt/intron-sip-agent/livekit.env     LiveKit credentials, root-only
+#   /etc/systemd/system/intron-sip-agent.service
+#
+# WHAT IT NEVER TOUCHES
+#   Intron's checkout (/home/ubuntu/service_voice_bots), their .env, their
+#   worker and dialer units, OpenSIPS. The agent IMPORTS their model wrappers
+#   and READS one key from their .env at start; it writes to none of it.
+#
+# SECRETS
+#   The LiveKit key pair is read from Secrets Manager on this laptop and sent
+#   over the SSH session's standard input — never on a command line, so never
+#   in shell history or a process list on either machine.
+
+set -euo pipefail
+
+AGENT_HOST="${AGENT_HOST:-ubuntu@3.11.207.6}"
+AGENT_SSH_KEY="${AGENT_SSH_KEY:-$HOME/.ssh/intron-voicebot-deploy-2026.pem}"
+ENV_NAME="${ENV_NAME:-beta}"
+export AWS_PROFILE="${AWS_PROFILE:-intron_aws}"
+export AWS_REGION="${AWS_REGION:-eu-west-1}"
+
+REMOTE_ROOT="/opt/intron-sip-agent"
+UNIT="intron-sip-agent"
+OLD_BRIDGE_UNIT="intron-sip-bridge-agent"
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+agent_dir="$(cd "$here/../../agent" && pwd)"
+
+die() { echo "intron-sip-agent: $*" >&2; exit 1; }
+say() { printf '\n==> %s\n' "$*"; }
+
+remote() {
+  ssh -i "$AGENT_SSH_KEY" -o BatchMode=yes -o ConnectTimeout=15 "$AGENT_HOST" "$@"
+}
+
+livekit_env() {
+  local s
+  s=$(aws secretsmanager get-secret-value --secret-id "intron-sip/${ENV_NAME}/livekit" \
+        --query SecretString --output text) \
+    || die "could not read intron-sip/${ENV_NAME}/livekit"
+  jq -er --arg url "wss://livekit-${ENV_NAME}.intron.quiverlearn.com" '
+    "LIVEKIT_URL=\($url)",
+    "LIVEKIT_API_KEY=\(.LIVEKIT_API_KEY)",
+    "LIVEKIT_API_SECRET=\(.LIVEKIT_API_SECRET)"' <<<"$s" \
+    || die "intron-sip/${ENV_NAME}/livekit is missing LIVEKIT_API_KEY or LIVEKIT_API_SECRET"
+}
+
+do_deploy() {
+  for bin in ssh scp aws jq; do command -v "$bin" >/dev/null || die "'$bin' not found"; done
+  [[ -f "$AGENT_SSH_KEY" ]] || die "no ssh key at $AGENT_SSH_KEY"
+  [[ -f "$agent_dir/intron_sip_agent.py" ]] || die "agent not found in $agent_dir"
+
+  say "checking the box"
+  remote 'set -e
+    test -d /home/ubuntu/service_voice_bots/service_convo_bot || { echo "their checkout is missing"; exit 1; }
+    test -x /data/omnivoice-venv/bin/python || { echo "their Python environment is missing"; exit 1; }
+    sudo -n true 2>/dev/null || { echo "passwordless sudo is not available"; exit 1; }
+    grep -q "^GOOGLE_API_KEY=" /home/ubuntu/service_voice_bots/service_convo_bot/.env \
+      || { echo "GOOGLE_API_KEY is not in their .env"; exit 1; }
+    echo ok' || die "the box is not ready"
+
+  say "copying the agent"
+  remote "rm -rf /tmp/intron-sip-agent-upload && mkdir -p /tmp/intron-sip-agent-upload"
+  scp -q -i "$AGENT_SSH_KEY" -o BatchMode=yes \
+    "$agent_dir/intron_sip_agent.py" "$agent_dir/instructions.txt" \
+    "$AGENT_HOST:/tmp/intron-sip-agent-upload/"
+
+  say "writing LiveKit credentials (root-only)"
+  livekit_env | remote "sudo install -D -m 600 -o root -g root /dev/stdin $REMOTE_ROOT/livekit.env"
+
+  say "installing the unit"
+  remote "sudo bash -s" <<REMOTE
+set -euo pipefail
+
+# The old bridge registers under the same agent name on the same LiveKit.
+# Two workers with one name split calls between them, so it goes.
+if systemctl list-unit-files ${OLD_BRIDGE_UNIT}.service >/dev/null 2>&1 \
+   && systemctl cat ${OLD_BRIDGE_UNIT}.service >/dev/null 2>&1; then
+  echo "stopping the old bridge (${OLD_BRIDGE_UNIT})"
+  systemctl disable --now ${OLD_BRIDGE_UNIT} || true
+fi
+
+install -d -m 755 -o root -g root ${REMOTE_ROOT}
+install -m 644 -o root -g root /tmp/intron-sip-agent-upload/intron_sip_agent.py ${REMOTE_ROOT}/
+install -m 644 -o root -g root /tmp/intron-sip-agent-upload/instructions.txt ${REMOTE_ROOT}/
+rm -rf /tmp/intron-sip-agent-upload
+
+cat > ${REMOTE_ROOT}/run-agent.sh <<'RUN'
+#!/usr/bin/env bash
+# Started by systemd as ubuntu. LiveKit credentials arrive from the unit's
+# EnvironmentFile; everything else is read here.
+set -euo pipefail
+
+THEIR_ENV=/home/ubuntu/service_voice_bots/service_convo_bot/.env
+
+# ONLY the keys this agent needs, read at every start so a rotation on their
+# side is picked up. Sourcing their whole .env would also bring in their
+# LIVEKIT_URL and point this worker at their LiveKit instead of ours.
+get() {
+  sed -n "s/^\$1=//p" "\$THEIR_ENV" | tail -n 1 \
+    | sed -e 's/^"\(.*\)"\$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+export GOOGLE_API_KEY="\$(get GOOGLE_API_KEY)"
+gac="\$(get GOOGLE_APPLICATION_CREDENTIALS)"
+if [ -n "\$gac" ]; then export GOOGLE_APPLICATION_CREDENTIALS="\$gac"; fi
+
+source /data/omnivoice-venv/bin/activate
+cd ${REMOTE_ROOT}
+exec python -u intron_sip_agent.py start
+RUN
+chmod 755 ${REMOTE_ROOT}/run-agent.sh
+
+cat > /etc/systemd/system/${UNIT}.service <<UNITFILE
+[Unit]
+Description=Intron SIP platform AI agent (LiveKit worker)
+After=network-online.target
+Wants=network-online.target
+# A crash loop backs off and stops rather than restarting forever.
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+EnvironmentFile=${REMOTE_ROOT}/livekit.env
+ExecStart=${REMOTE_ROOT}/run-agent.sh
+Restart=always
+RestartSec=10
+# Long enough for a call in progress to finish a sentence and drain.
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
+UNITFILE
+
+systemctl daemon-reload
+systemctl enable ${UNIT} >/dev/null 2>&1
+systemctl restart ${UNIT}
+echo "started"
+REMOTE
+
+  say "waiting for the agent to load its models and register (up to 6 minutes)"
+  remote "for i in \$(seq 1 72); do
+      if sudo journalctl -u $UNIT --since '-10min' --no-pager -o cat | grep -q 'registered worker'; then
+        echo 'registered with LiveKit'; exit 0; fi
+      if ! systemctl is-active --quiet $UNIT && [ \"\$(systemctl show -p SubState --value $UNIT)\" != auto-restart ]; then
+        echo 'the agent stopped:'; sudo journalctl -u $UNIT -n 40 --no-pager -o cat; exit 1; fi
+      sleep 5
+    done
+    echo 'not registered after 6 minutes; recent log:'; sudo journalctl -u $UNIT -n 40 --no-pager -o cat; exit 1"
+}
+
+do_status() {
+  remote "systemctl status $UNIT --no-pager -n 0 2>/dev/null | head -5; echo; sudo journalctl -u $UNIT -n 30 --no-pager -o cat"
+}
+
+do_logs()    { remote "sudo journalctl -u $UNIT -f -o cat"; }
+do_restart() { remote "sudo systemctl restart $UNIT && echo restarted"; }
+
+do_uninstall() {
+  remote "sudo bash -s" <<REMOTE
+set -e
+systemctl disable --now ${UNIT} 2>/dev/null || true
+rm -f /etc/systemd/system/${UNIT}.service
+systemctl daemon-reload
+rm -rf ${REMOTE_ROOT}
+echo "removed ${UNIT} and ${REMOTE_ROOT}"
+REMOTE
+}
+
+case "${1:-}" in
+  deploy)    do_deploy ;;
+  status)    do_status ;;
+  logs)      do_logs ;;
+  restart)   do_restart ;;
+  uninstall) do_uninstall ;;
+  *) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

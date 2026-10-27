@@ -6,7 +6,7 @@ instance that never registered with SSM looks identical to one that did until
 you try to reach it, and by then you have built two more stages on top.
 
 Run every command from `infra/iac` unless a stage says otherwise. Credentials
-come from the `klarity_aws` profile named in the config - in every Terraform
+come from the `intron_aws` profile named in the config - in every Terraform
 provider, backend and remote_state block, and in the Ansible inventory. Nothing
 needs exporting and there is no MFA wrapper.
 
@@ -20,8 +20,9 @@ needs exporting and there is no MFA wrapper.
 | **5** | `control-plane` | 1 app EC2, private DNS | ~$88/mo | DNS resolves *from inside the VPC* |
 
 **Steady state ≈ $384/month**, excluding data transfer. Figures are eu-central-1
-on-demand, pulled from the Pricing API on the day this was written — treat them
-as the right order of magnitude, not a quote.
+on-demand, pulled from the Pricing API when the platform ran there. eu-west-1
+is usually slightly cheaper for the same instance types, so treat them as the
+right order of magnitude, not a quote.
 
 Stages are operational, not structural. There are no "stage" directories: the
 stacks already sit at the right granularity, and renaming them would change
@@ -76,14 +77,14 @@ make apply STACK=secrets-manager ENV=beta
 ### Gate
 
 ```bash
-export AWS_PROFILE=klarity_aws AWS_REGION=eu-central-1
+export AWS_PROFILE=intron_aws AWS_REGION=eu-west-1
 
 # Versioning is what makes a corrupted state file recoverable. If this says
 # anything other than Enabled, stop — every later stage writes state here.
-aws s3api get-bucket-versioning --bucket intron-sip-tfstate-eu-central-1
+aws s3api get-bucket-versioning --bucket intron-sip-tfstate-eu-west-1
 
 # This stack's own state should now be IN the bucket.
-aws s3 ls s3://intron-sip-tfstate-eu-central-1/stacks/tfstate/beta/
+aws s3 ls s3://intron-sip-tfstate-eu-west-1/stacks/tfstate/beta/
 
 aws secretsmanager list-secrets \
   --query 'SecretList[?starts_with(Name,`intron-sip/beta/`)].Name' --output table
@@ -138,7 +139,7 @@ make apply STACK=network ENV=beta
 ### Gate
 
 ```bash
-export AWS_PROFILE=klarity_aws AWS_REGION=eu-central-1
+export AWS_PROFILE=intron_aws AWS_REGION=eu-west-1
 
 # Set this FIRST — without it the filters below read Values= and match nothing,
 # which looks like an empty VPC rather than an unset variable.
@@ -182,12 +183,12 @@ make apply STACK=ecr ENV=beta
 ### Gate
 
 ```bash
-export AWS_PROFILE=klarity_aws AWS_REGION=eu-central-1
+export AWS_PROFILE=intron_aws AWS_REGION=eu-west-1
 
 make output STACK=ecr ENV=beta EXTRA="repository_urls"
 
 aws ecr get-login-password | docker login --username AWS \
-  --password-stdin "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.eu-central-1.amazonaws.com"
+  --password-stdin "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.eu-west-1.amazonaws.com"
 ```
 
 ---
@@ -209,7 +210,7 @@ only way in.** If the agent does not register, the box is unreachable and the
 only remedy is to replace it. Check before doing anything else:
 
 ```bash
-export AWS_PROFILE=klarity_aws AWS_REGION=eu-central-1
+export AWS_PROFILE=intron_aws AWS_REGION=eu-west-1
 
 # Give it ~3-5 minutes after apply. Both instances must appear, PingStatus Online.
 aws ssm describe-instance-information \
@@ -313,7 +314,7 @@ and clobbering them would surface as the API rejecting every Kamailio request.
 ### Gate
 
 ```bash
-export AWS_PROFILE=klarity_aws AWS_REGION=eu-central-1
+export AWS_PROFILE=intron_aws AWS_REGION=eu-west-1
 
 aws rds describe-db-instances --db-instance-identifier beta-intron-sip-db \
   --query 'DBInstances[].[DBInstanceStatus,Engine,EngineVersion,MultiAZ,PubliclyAccessible,StorageEncrypted]' --output table
@@ -364,7 +365,7 @@ The hosted zone is private by design, so resolution has to be checked from
 inside the VPC:
 
 ```bash
-export AWS_PROFILE=klarity_aws AWS_REGION=eu-central-1
+export AWS_PROFILE=intron_aws AWS_REGION=eu-west-1
 FS=$(make output STACK=sip-core ENV=beta EXTRA="-raw freeswitch_instance_ids" | tr -d '[]", ')
 
 CMD=$(aws ssm send-command --document-name AWS-RunShellScript \
@@ -482,7 +483,7 @@ carriers can deliver the moment it does:
 control-plane → freeswitch → edge
 ```
 
-Ansible authenticates with the same `klarity_aws` profile, set as
+Ansible authenticates with the same `intron_aws` profile, set as
 `ansible_aws_ssm_profile` in the inventory. Prove the path works first:
 
 ```bash

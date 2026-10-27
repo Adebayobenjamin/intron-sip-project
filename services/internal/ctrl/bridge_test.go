@@ -27,7 +27,7 @@ func aiPlan() admission.Verdict {
 func handoffPlan() admission.Verdict {
 	v := admitted()
 	v.Destination = admission.DestinationHandoff
-	v.Recording = false
+	v.RecordingMode = admission.RecordingNone
 	return v
 }
 
@@ -52,14 +52,14 @@ func TestConnect_AnswersThenBridges(t *testing.T) {
 	}
 }
 
-// A plan that cannot be routed must be refused BEFORE the answer. Answering
+// A line that cannot be routed must be refused BEFORE the answer. Answering
 // first starts carrier billing on a call that is about to fail, and makes the
 // failure look to the caller like a connection that died.
-func TestConnect_UnroutablePlanIsRefusedBeforeAnswer(t *testing.T) {
-	routes := &fakeRoutes{agentErr: route.ErrNoAgentConfig}
+func TestConnect_UnroutableLineIsRefusedBeforeAnswer(t *testing.T) {
+	routes := &fakeRoutes{targetsErr: errors.New("connection refused")}
 	ledger := &fakeLedger{}
 
-	cmds := playCall(t, &stubResolver{verdict: aiPlan()}, ledger, routes)
+	cmds := playCall(t, &stubResolver{verdict: handoffPlan()}, ledger, routes)
 
 	if i := commandIndex(cmds, "execute-app-name: answer"); i >= 0 {
 		t.Error("an unroutable call was answered")
@@ -120,33 +120,27 @@ func TestBridge_LiveKitDialString(t *testing.T) {
 		t.Errorf("missing the livekit egress header: %q", bridge)
 	}
 
-	// The room goes in the user part, which is what livekit-sip matches a
-	// dispatch rule against. With no template it defaults to the channel UUID.
+	// The room — the channel UUID — goes in the user part.
 	if !strings.Contains(bridge, defaultChannel().uuid+"@") {
 		t.Errorf("the room is not in the user part: %q", bridge)
 	}
 }
 
-// A room template lets the LiveKit side recognise something in the name.
-func TestBridge_RoomTemplateIsRendered(t *testing.T) {
+// The AI leg needs no per-line configuration: every call reaches the same
+// agent, summoned by LiveKit's dispatch rule. So routing is never consulted,
+// and the room the record names is the one in the dial string.
+func TestBridge_AILegNeedsNoRoutingLookup(t *testing.T) {
 	ledger := &fakeLedger{}
-	routes := &fakeRoutes{agent: route.AgentConfig{
-		RoomTemplate:  "intron-{tenant_id}-{call_uuid}",
-		AgentIdentity: "agent",
-	}}
+	routes := &fakeRoutes{targetsErr: errors.New("must not be consulted for the AI leg")}
 
 	cmds := playCall(t, &stubResolver{verdict: aiPlan()}, ledger, routes)
-
-	want := "intron-t_acme-" + defaultChannel().uuid
-	bridge, _ := findCommand(cmds, "execute-app-name: bridge")
-	if !strings.Contains(bridge, want) {
-		t.Errorf("want room %q in %q", want, bridge)
+	if i := commandIndex(cmds, "execute-app-name: bridge"); i < 0 {
+		t.Fatalf("the AI leg was not bridged: %v", cmds)
 	}
 
-	// And it reaches the record, so a call can be found from the LiveKit side.
 	rec := ledger.waitForRecord(t)
-	if rec.LiveKitRoom != want {
-		t.Errorf("LiveKitRoom = %q, want %q", rec.LiveKitRoom, want)
+	if rec.LiveKitRoom != defaultChannel().uuid {
+		t.Errorf("LiveKitRoom = %q, want the call uuid", rec.LiveKitRoom)
 	}
 }
 
@@ -174,7 +168,7 @@ func TestBridge_HandoffUsesFailoverOrder(t *testing.T) {
 	if !strings.Contains(bridge, "sip:queue@sbc.client.example") {
 		t.Errorf("first target missing: %q", bridge)
 	}
-	// An E.164 target leaves by the tenant's trunk.
+	// An E.164 target leaves by the call's trunk.
 	if !strings.Contains(bridge, "+442071234567@trunk.example") {
 		t.Errorf("second target missing its trunk: %q", bridge)
 	}
@@ -230,7 +224,7 @@ func TestBridge_SkipsUndiallableTargets(t *testing.T) {
 // end picked up.
 func TestRecording_StartsBetweenAnswerAndBridge(t *testing.T) {
 	v := aiPlan()
-	v.Recording = true
+	v.RecordingMode = admission.RecordingAIOnly
 
 	cmds := playCall(t, &stubResolver{verdict: v}, &fakeLedger{}, &fakeRoutes{})
 
@@ -250,7 +244,7 @@ func TestRecording_StartsBetweenAnswerAndBridge(t *testing.T) {
 // separated back into who said what, which is most of what a recording is for.
 func TestRecording_IsStereo(t *testing.T) {
 	v := aiPlan()
-	v.Recording = true
+	v.RecordingMode = admission.RecordingFull
 
 	cmds := playCall(t, &stubResolver{verdict: v}, &fakeLedger{}, &fakeRoutes{})
 
@@ -268,7 +262,7 @@ func TestRecording_IsStereo(t *testing.T) {
 // it, because changing it later means finding all three.
 func TestRecording_PathShapeAndRecord(t *testing.T) {
 	v := aiPlan()
-	v.Recording = true
+	v.RecordingMode = admission.RecordingAIOnly
 	ledger := &fakeLedger{}
 
 	cmds := playCall(t, &stubResolver{verdict: v}, ledger, &fakeRoutes{})
@@ -286,14 +280,75 @@ func TestRecording_PathShapeAndRecord(t *testing.T) {
 	}
 }
 
-func TestRecording_SkippedWhenThePlanSaysSo(t *testing.T) {
+func TestRecording_SkippedWhenTheLineSaysSo(t *testing.T) {
 	v := aiPlan()
-	v.Recording = false
+	v.RecordingMode = admission.RecordingNone
 
 	cmds := playCall(t, &stubResolver{verdict: v}, &fakeLedger{}, &fakeRoutes{})
 
 	if i := commandIndex(cmds, "record_session"); i >= 0 {
-		t.Error("recording started for a plan that does not ask for it")
+		t.Error("recording started for a line that does not ask for it")
+	}
+}
+
+// ai_only on a line that goes straight to a human has no AI half to record.
+// Starting a recording here would record exactly the conversation the policy
+// exists to leave alone.
+func TestRecording_AIOnlyLineGoingStraightToAHumanRecordsNothing(t *testing.T) {
+	v := handoffPlan()
+	v.RecordingMode = admission.RecordingAIOnly
+
+	cmds := playCall(t, &stubResolver{verdict: v}, &fakeLedger{}, handoffRoutes())
+	assertBridged(t, cmds)
+
+	if i := commandIndex(cmds, "record_session"); i >= 0 {
+		t.Error("an ai_only line recorded a call that never reached the AI")
+	}
+}
+
+// full records a human from the start, too.
+func TestRecording_FullRecordsAStraightHandoff(t *testing.T) {
+	v := handoffPlan()
+	v.RecordingMode = admission.RecordingFull
+
+	cmds := playCall(t, &stubResolver{verdict: v}, &fakeLedger{}, handoffRoutes())
+	if i := commandIndex(cmds, "execute-app-name: record_session"); i < 0 {
+		t.Errorf("a full-recording line did not record: %v", cmds)
+	}
+}
+
+// The mode the call ran under reaches the record, so a recording that is or is
+// not there can be explained later.
+func TestRecording_ModeReachesTheRecord(t *testing.T) {
+	v := aiPlan()
+	v.RecordingMode = admission.RecordingFull
+	ledger := &fakeLedger{}
+
+	playCall(t, &stubResolver{verdict: v}, ledger, &fakeRoutes{})
+
+	if rec := ledger.waitForRecord(t); rec.RecordingMode != "full" {
+		t.Errorf("RecordingMode = %q, want full", rec.RecordingMode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The handoff trunk
+// ---------------------------------------------------------------------------
+
+// THE PLATFORM-TRUNK BUG. An E.164 target must leave by the trunk the call is
+// on, which admission found from the number. The old lookup joined "the
+// tenant's default trunk", which a tenant on the platform trunk does not have.
+func TestBridge_HandoffAsksForTheCallsTrunk(t *testing.T) {
+	routes := handoffRoutes()
+	playCall(t, &stubResolver{verdict: handoffPlan()}, &fakeLedger{}, routes)
+
+	q := routes.handoffQueries()
+	if len(q) != 1 {
+		t.Fatalf("HandoffTargets called %d times, want 1", len(q))
+	}
+	want := handoffQuery{tenant: "t_acme", trafficConfigID: 21, trunkID: 9}
+	if q[0] != want {
+		t.Errorf("asked for %+v, want %+v — the line for overrides, the call's trunk for E.164", q[0], want)
 	}
 }
 

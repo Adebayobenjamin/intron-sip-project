@@ -5,7 +5,7 @@ variable "environment" {
 
 variable "aws_region" {
   type        = string
-  description = "See stacks/network/beta/variables.tf for why eu-central-1 and not af-south-1."
+  description = "See stacks/network/beta/variables.tf for why eu-west-1 and not af-south-1."
 }
 
 variable "aws_profile" {

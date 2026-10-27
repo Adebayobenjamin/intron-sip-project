@@ -26,15 +26,24 @@ type OriginateRequest struct {
 	CallUUID string `json:"call_uuid"`
 
 	TenantID string `json:"tenant_id"`
-	PlanID   string `json:"plan_id,omitempty"`
 
-	// FromDID is the number the call presents, and the number whose row chose
-	// the trunk. One lookup, three answers — see docs/API.md, Contract 3.
+	// TrafficConfigID is the OUTBOUND line whose numbers include FromDID. It
+	// is found from the number, not named by the caller, and it supplies both
+	// the trunk and what the answered customer is connected to.
+	TrafficConfigID int64 `json:"traffic_config_id"`
+
+	// FromDID is the number the call presents. One lookup, three answers —
+	// ownership, caller ID and trunk; see docs/API.md, Contract 3.
 	FromDID  string `json:"from_did"`
 	ToNumber string `json:"to_number"`
 
 	TrunkID   int64  `json:"trunk_id,omitempty"`
 	TrunkHost string `json:"-"`
+
+	// TrunkPort is the carrier's SIP port. Not every carrier listens on 5060,
+	// and a dial string that names only the host sends the INVITE to 5060
+	// regardless — which a carrier on another port never answers.
+	TrunkPort int `json:"-"`
 
 	Status    string     `json:"status"`
 	ClaimedBy string     `json:"claimed_by,omitempty"`
@@ -42,4 +51,13 @@ type OriginateRequest struct {
 	Error     string     `json:"error,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
+}
+
+// OutboundLine is what a from-number resolves to before an outbound call is
+// queued: the line that owns it, and the trunk that line leaves by.
+type OutboundLine struct {
+	TrafficConfigID int64
+	TrunkID         int64
+	TrunkHost       string
+	RecordingMode   string
 }

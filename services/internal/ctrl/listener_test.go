@@ -115,12 +115,13 @@ func (f *fakeLedger) waitForRecord(t *testing.T) calls.Record {
 
 func admitted() admission.Verdict {
 	return admission.Verdict{
-		Admitted:    true,
-		Reason:      admission.ReasonOK,
-		TenantID:    "t_acme",
-		PlanID:      "p_main",
-		Destination: admission.DestinationAI,
-		Recording:   true,
+		Admitted:        true,
+		Reason:          admission.ReasonOK,
+		TenantID:        "t_acme",
+		TrafficConfigID: 21,
+		TrunkID:         9,
+		Destination:     admission.DestinationAI,
+		RecordingMode:   admission.RecordingAIOnly,
 	}
 }
 
@@ -317,11 +318,6 @@ func TestHangupCause(t *testing.T) {
 			want:    causeUnallocated,
 		},
 		{
-			name:    "withdrawn number",
-			verdict: refused(admission.ReasonDIDInactive),
-			want:    causeUnallocated,
-		},
-		{
 			// Ours, refused on purpose. 403 not 404 — telling a carrier the
 			// number does not exist invites it to be reallocated.
 			name:    "suspended tenant",
@@ -329,20 +325,20 @@ func TestHangupCause(t *testing.T) {
 			want:    causeRejected,
 		},
 		{
-			name:    "plan switched off",
-			verdict: refused(admission.ReasonPlanInactive),
+			name:    "line switched off",
+			verdict: refused(admission.ReasonTrafficConfigInactive),
 			want:    causeRejected,
 		},
 		{
-			name:    "plan configured to refuse",
-			verdict: refused(admission.ReasonPlanRejects),
+			name:    "line configured to refuse",
+			verdict: refused(admission.ReasonTrafficConfigRejects),
 			want:    causeRejected,
 		},
 		{
 			// Our misconfiguration, not the caller's problem. The number does
 			// exist and will work once someone finishes setting it up.
-			name:    "provisioned with no plan",
-			verdict: refused(admission.ReasonNoPlan),
+			name:    "on a trunk with no line",
+			verdict: refused(admission.ReasonNoTrafficConfig),
 			want:    causeTemporary,
 		},
 		{
@@ -519,33 +515,46 @@ func expectClosed(fs *fakeFS, within time.Duration) error {
 
 // fakeRoutes stands in for the routing config in the database.
 type fakeRoutes struct {
-	agent      route.AgentConfig
-	agentErr   error
+	mu sync.Mutex
+
 	targets    []route.HandoffTarget
 	targetsErr error
-	plan       route.Plan
-	planErr    error
+	line       route.Line
+	lineErr    error
+
+	// handoffAsked records what each HandoffTargets call asked for, so a test
+	// can check WHICH trunk an E.164 handoff was told to leave by.
+	handoffAsked []handoffQuery
 }
 
-func (f *fakeRoutes) AgentConfig(context.Context, string) (route.AgentConfig, error) {
-	if f.agentErr != nil {
-		return route.AgentConfig{}, f.agentErr
+type handoffQuery struct {
+	tenant          string
+	trafficConfigID int64
+	trunkID         int64
+}
+
+func (f *fakeRoutes) TrafficConfigByID(context.Context, int64) (route.Line, error) {
+	if f.lineErr != nil {
+		return route.Line{}, f.lineErr
 	}
-	return f.agent, nil
+	return f.line, nil
 }
 
-func (f *fakeRoutes) PlanByID(context.Context, string) (route.Plan, error) {
-	if f.planErr != nil {
-		return route.Plan{}, f.planErr
-	}
-	return f.plan, nil
-}
+func (f *fakeRoutes) HandoffTargets(_ context.Context, tenant string, trafficConfigID, trunkID int64) ([]route.HandoffTarget, error) {
+	f.mu.Lock()
+	f.handoffAsked = append(f.handoffAsked, handoffQuery{tenant, trafficConfigID, trunkID})
+	f.mu.Unlock()
 
-func (f *fakeRoutes) HandoffTargets(context.Context, string) ([]route.HandoffTarget, error) {
 	if f.targetsErr != nil {
 		return nil, f.targetsErr
 	}
 	return f.targets, nil
+}
+
+func (f *fakeRoutes) handoffQueries() []handoffQuery {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]handoffQuery(nil), f.handoffAsked...)
 }
 
 // fakeProbe stands in for asking FreeSWITCH whether a channel is still up.

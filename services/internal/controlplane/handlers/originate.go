@@ -13,7 +13,7 @@ import (
 
 // Originate is the store, narrowed.
 type Originate interface {
-	ResolveFromDID(ctx context.Context, number, tenantID string) (trunkID int64, trunkHost string, err error)
+	ResolveOutbound(ctx context.Context, number, tenantID string) (calls.OutboundLine, error)
 	ClaimCall(ctx context.Context, c calls.Claim) error
 	QueueOriginate(ctx context.Context, r calls.OriginateRequest) (calls.OriginateRequest, error)
 	GetOriginate(ctx context.Context, callUUID, tenantID string) (calls.OriginateRequest, error)
@@ -55,11 +55,13 @@ func (h OriginateHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// No line in the request. The line is FOUND from the from-number — the
+	// outbound traffic config whose numbers include it — so a caller cannot
+	// pick a line that does not own the number it presents.
 	var req struct {
 		TenantID string `json:"tenant_id"`
 		From     string `json:"from"`
 		To       string `json:"to"`
-		PlanID   string `json:"plan_id"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -71,8 +73,8 @@ func (h OriginateHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Normalised with the same function the call path uses, so a number given
-	// as 0049… matches the row stored as +49… — and so the DID lookup below
-	// cannot miss a number that is plainly provisioned.
+	// as 0049… matches a block stored from +49… — and so the lookup below
+	// cannot miss a number that is plainly configured.
 	from := admission.Normalise(req.From)
 	to := admission.Normalise(req.To)
 
@@ -81,33 +83,33 @@ func (h OriginateHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// THE AUTHORISATION CHECK, and it is this one line.
+	// THE AUTHORISATION CHECK, and it is this one lookup.
 	//
-	// The from-DID must be active and owned by the tenant. Without it, anyone
-	// who can reach this endpoint can present any number on the platform —
-	// including another tenant's — and caller-ID validation that trusts its
-	// caller is not validation.
+	// The from-number must be inside an ACTIVE OUTBOUND line belonging to the
+	// tenant. Without it, anyone who can reach this endpoint can present any
+	// number on the platform — including another tenant's — and caller-ID
+	// validation that trusts its caller is not validation.
 	//
-	// The same row supplies the trunk, which makes a caller-ID/trunk mismatch
+	// The same line supplies the trunk, which makes a caller-ID/trunk mismatch
 	// unrepresentable rather than merely unlikely: carriers verify the calling
 	// number belongs to the account the call arrives on.
-	trunkID, trunkHost, err := h.Store.ResolveFromDID(r.Context(), from, tenant)
+	line, err := h.Store.ResolveOutbound(r.Context(), from, tenant)
 	if errors.Is(err, store.ErrNotFound) {
 		fail(w, http.StatusForbidden,
-			"the from number is not an active DID belonging to this tenant")
+			"the from number is not covered by an active outbound traffic config belonging to this tenant")
 		return
 	}
 	if err != nil {
-		failErr(w, h.Log, "resolve from-did", err)
+		failErr(w, h.Log, "resolve outbound line", err)
 		return
 	}
 
-	if trunkHost == "" {
-		// The DID exists but has no trunk to leave by. Caught here rather than
-		// by the controller, where it would fail after the request was
-		// accepted and the caller had been told 202.
+	if line.TrunkHost == "" {
+		// The line exists but its trunk has no host to dial. Caught here
+		// rather than by the controller, where it would fail after the
+		// request was accepted and the caller had been told 202.
 		fail(w, http.StatusConflict,
-			"the from-DID has no trunk with a SIP host; set trunk_id on the DID first")
+			"the outbound line's trunk has no sip_host; set it on the trunk first")
 		return
 	}
 
@@ -116,14 +118,19 @@ func (h OriginateHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// Claimed BEFORE queueing, so a tenant at its cap cannot fill a queue with
 	// calls it may not place. The controller does not claim again when the
 	// answered socket arrives — that would count the same call twice.
+	//
+	// The claim also SNAPSHOTS the line's recording mode. The call starts now,
+	// so the policy in force now governs it, and the answered socket reads it
+	// back from this row.
 	claim := calls.Claim{
-		UUID:      callUUID,
-		TenantID:  tenant,
-		PlanID:    req.PlanID,
-		TrunkID:   trunkID,
-		Direction: calls.DirectionOutbound,
-		DID:       from,
-		Callee:    to,
+		UUID:            callUUID,
+		TenantID:        tenant,
+		TrafficConfigID: line.TrafficConfigID,
+		TrunkID:         line.TrunkID,
+		Direction:       calls.DirectionOutbound,
+		DID:             from,
+		Callee:          to,
+		RecordingMode:   line.RecordingMode,
 	}
 
 	if err := h.Store.ClaimCall(r.Context(), claim); err != nil {
@@ -139,12 +146,12 @@ func (h OriginateHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	queued, err := h.Store.QueueOriginate(r.Context(), calls.OriginateRequest{
-		CallUUID: callUUID,
-		TenantID: tenant,
-		PlanID:   req.PlanID,
-		FromDID:  from,
-		ToNumber: to,
-		TrunkID:  trunkID,
+		CallUUID:        callUUID,
+		TenantID:        tenant,
+		TrafficConfigID: line.TrafficConfigID,
+		FromDID:         from,
+		ToNumber:        to,
+		TrunkID:         line.TrunkID,
 	})
 	if err != nil {
 		failErr(w, h.Log, "queue originate", err)

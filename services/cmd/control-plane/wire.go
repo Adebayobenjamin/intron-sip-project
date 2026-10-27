@@ -16,7 +16,6 @@ import (
 	"github.com/Adebayobenjamin/intron-sip-project/services/internal/shared/logger"
 	"github.com/Adebayobenjamin/intron-sip-project/services/internal/shared/run"
 	"github.com/Adebayobenjamin/intron-sip-project/services/internal/store"
-	"github.com/Adebayobenjamin/intron-sip-project/services/internal/twilio"
 )
 
 const (
@@ -48,7 +47,6 @@ func runMain() error {
 		"api_addr", cfg.APIListenAddr,
 		"health_addr", cfg.HealthListenAddr,
 		"db_max_conns", cfg.MaxConns,
-		"twilio_configured", cfg.TwilioAccountSID != "",
 	)
 
 	storeCfg := store.Config{
@@ -88,23 +86,6 @@ func runMain() error {
 	// key exists — including for the request that creates the first one.
 	authenticator := auth.New(pool, cfg.APITokens)
 
-	// Twilio is optional. Without credentials the drift endpoint answers 501
-	// rather than the service refusing to start — configuration is still
-	// perfectly serveable without it.
-	var carrier handlers.CarrierReader
-	if cfg.TwilioConfigured() {
-		user, pass := cfg.TwilioAuth()
-		carrier = twilio.New(cfg.TwilioAccountSID, user, pass)
-	} else {
-		log.Warn("twilio not configured; trunk drift detection is unavailable")
-	}
-	if cfg.EdgeSIPURI == "" {
-		// Without it, drift can report what Twilio has but cannot say whether
-		// it is right — and the one check that matters most is exactly that
-		// comparison.
-		log.Warn("EDGE_SIP_URI is not set; drift cannot verify the origination URI")
-	}
-
 	api := router.New(router.Deps{
 		Auth: authenticator,
 		Config: handlers.ConfigHandler{
@@ -112,14 +93,13 @@ func runMain() error {
 			Admission: admissions,
 			Log:       log,
 		},
-		Trunks: handlers.TrunksHandler{Store: pool, Log: log},
-		Drift: handlers.DriftHandler{
-			Store:      pool,
-			Carrier:    carrier,
-			EdgeSIPURI: cfg.EdgeSIPURI,
-			Log:        log,
+		TrafficConfigs: handlers.TrafficConfigsHandler{
+			Store:     pool,
+			Admission: admissions,
+			Log:       log,
 		},
-		Route: handlers.Route{Admission: admissions, Log: log},
+		Trunks: handlers.TrunksHandler{Store: pool, Admission: admissions, Log: log},
+		Route:  handlers.Route{Admission: admissions, Log: log},
 		Originate: handlers.OriginateHandler{
 			Store: pool,
 			UUID:  ids.Generator{},

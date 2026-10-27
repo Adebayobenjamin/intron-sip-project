@@ -129,61 +129,45 @@ func TestOpen_RequiresExplicitMaxConns(t *testing.T) {
 	}
 }
 
-// A number belongs to exactly one tenant. Without the partial unique index,
-// two tenants can claim the same DID and which one answers depends on row
-// order — calls occasionally reaching the wrong customer.
-func TestSchema_DIDIsUniqueAcrossTenants(t *testing.T) {
+// A number arrives on exactly one trunk. Without the exclusion constraint two
+// trunks could claim it, and which carrier — and so which tenant — a call is
+// attributed to would depend on row order.
+func TestSchema_NumberIsOnOneTrunkOnly(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedPool(t)
 
-	mustExec(t, pool, `INSERT INTO tenants (id, name) VALUES ('t1', 'One'), ('t2', 'Two')`)
-	mustExec(t, pool, `INSERT INTO dids (number, tenant_id) VALUES ('+4930123456', 't1')`)
+	insert := `INSERT INTO trunks (slug, name, carrier, sip_auth_method, did_ranges)
+	           VALUES ($1, $1, 'twilio', 'ip_whitelisting', $2::int8multirange)`
 
-	_, err := pool.Exec(ctx,
-		`INSERT INTO dids (number, tenant_id) VALUES ('+4930123456', 't2')`)
-	if err == nil {
-		t.Fatal("want a unique violation when two tenants claim one number")
+	mustExec(t, pool, insert, "twilio", "{[2348000000100,2348000000200)}")
+
+	if _, err := pool.Exec(ctx, insert, "other", "{[2348000000199,2348000000300)}"); err == nil {
+		t.Fatal("want an exclusion violation when two trunks carry one number")
 	}
 
-	// A soft-deleted row must not block re-allocating the number: a DID
-	// released by one tenant and sold to another is an ordinary event.
-	mustExec(t, pool, `UPDATE dids SET deleted_at = now() WHERE number = '+4930123456'`)
-	mustExec(t, pool, `INSERT INTO dids (number, tenant_id) VALUES ('+4930123456', 't2')`)
+	// A soft-deleted trunk must not block re-allocating its numbers: a block
+	// moved from one carrier to another is an ordinary event.
+	mustExec(t, pool, `UPDATE trunks SET deleted_at = now() WHERE slug = 'twilio'`)
+	mustExec(t, pool, insert, "other", "{[2348000000199,2348000000300)}")
 }
 
-// Two default trunks would make egress routing depend on row order.
-func TestSchema_OnlyOneDefaultTrunk(t *testing.T) {
-	ctx := context.Background()
-	pool := migratedPool(t)
-
-	insert := `INSERT INTO trunks (slug, name, type, carrier, sip_auth_method, is_default)
-	           VALUES ($1, $1, 'bi_directional', 'twilio', 'ip_whitelisting', true)`
-
-	mustExec(t, pool, insert, "twilio-frankfurt")
-
-	if _, err := pool.Exec(ctx, insert, "twilio-dublin"); err == nil {
-		t.Fatal("want a unique violation on a second default trunk")
-	}
-}
-
-// A plan destination outside the three the controller knows how to act on
+// A line destination outside the three the controller knows how to act on
 // would be a call the controller cannot route, discovered at call time.
-func TestSchema_PlanDestinationIsConstrained(t *testing.T) {
+func TestSchema_LineDestinationIsConstrained(t *testing.T) {
 	ctx := context.Background()
 	pool := migratedPool(t)
 
 	mustExec(t, pool, `INSERT INTO tenants (id, name) VALUES ('t1', 'One')`)
+	mustExec(t, pool, `INSERT INTO trunks (id, slug, name, carrier, sip_auth_method, did_ranges)
+	                   VALUES (1, 'x', 'X', 'x', 'ip_whitelisting', '{[100,200)}')`)
 
-	_, err := pool.Exec(ctx,
-		`INSERT INTO inbound_plans (id, tenant_id, name, destination)
-		 VALUES ('p1', 't1', 'Main', 'voicemail')`)
-	if err == nil {
+	insert := `INSERT INTO traffic_configs (tenant_id, trunk_id, name, direction, did_ranges, destination)
+	           VALUES ('t1', 1, 'Main', 'inbound', '{[100,150)}', $1)`
+
+	if _, err := pool.Exec(ctx, insert, "voicemail"); err == nil {
 		t.Fatal("want a check violation for an unknown destination")
 	}
-
-	mustExec(t, pool,
-		`INSERT INTO inbound_plans (id, tenant_id, name, destination)
-		 VALUES ('p1', 't1', 'Main', 'ai')`)
+	mustExec(t, pool, insert, "ai")
 }
 
 func migratedPool(t *testing.T) *Pool {

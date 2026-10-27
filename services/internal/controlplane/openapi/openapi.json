@@ -3,7 +3,7 @@
   "info": {
     "title": "Intron control plane",
     "version": "0.1.0",
-    "description": "Configuration and actions for the Intron SIP platform.\n\n**Nothing here is in the path of a call.** The ESL controller carries calls and reads Postgres directly; this API exists so a human or a script can configure the platform and see what it did.\n\n## Authentication\n\nEvery endpoint takes `Authorization: Bearer <key>`. Two kinds of key work:\n\n- **`CONTROL_PLANE_API_TOKEN`** from the environment \u2014 admin, platform-wide. It has to work before any key exists, including for the request that creates the first one.\n- **An API key** from `POST /v1/api-keys` \u2014 scoped to a tenant, revocable, stored as a SHA-256 hash and shown exactly once.\n\n## Tenant scoping\n\nA platform key may name any tenant. A tenant-scoped key **always** gets its own, whatever `tenant_id` says \u2014 that is what stops the query parameter being a cross-tenant read.\n\n`404` covers both \"no such row\" and \"exists but is not yours\", deliberately: answering `403` for the second would confirm it exists.\n\n## Statuses\n\n| | |\n|---|---|\n| `400` | The body is wrong. **Unknown JSON fields are rejected** \u2014 a typo in `recording` would otherwise be silently ignored |\n| `401` | No token, or one that is not recognised |\n| `403` | Authenticated, but not permitted |\n| `409` | The request conflicts with the current state, e.g. deleting a trunk DIDs still use |\n| `429` | The tenant is at its concurrency cap |\n| `501` | Deliberately not implemented, e.g. `sip_password` before credential encryption exists |\n| `502` | An upstream (Twilio) could not be reached |\n"
+    "description": "Configuration and actions for the Intron SIP platform.\n\n**Nothing here is in the path of a call.** The ESL controller carries calls and reads Postgres directly; this API exists so a human or a script can configure the platform and see what it did.\n\n## Authentication\n\nEvery endpoint takes `Authorization: Bearer <key>`. Two kinds of key work:\n\n- **`CONTROL_PLANE_API_TOKEN`** from the environment \u2014 admin, platform-wide. It has to work before any key exists, including for the request that creates the first one.\n- **An API key** from `POST /v1/api-keys` \u2014 scoped to a tenant, revocable, stored as a SHA-256 hash and shown exactly once.\n\n## Tenant scoping\n\nA platform key may name any tenant. A tenant-scoped key **always** gets its own, whatever `tenant_id` says \u2014 that is what stops the query parameter being a cross-tenant read.\n\n`404` covers both \"no such row\" and \"exists but is not yours\", deliberately: answering `403` for the second would confirm it exists.\n\n## Statuses\n\n| | |\n|---|---|\n| `400` | The body is wrong. **Unknown JSON fields are rejected** \u2014 a typo in `recording_mode` would otherwise be silently ignored |\n| `401` | No token, or one that is not recognised |\n| `403` | Authenticated, but not permitted |\n| `409` | The database refused the change because it breaks a rule \u2014 numbers already claimed by another trunk or line, a line outside its trunk's numbers, deleting a trunk lines still use. The message says which |\n| `429` | The tenant is at its concurrency cap |\n| `501` | Deliberately not implemented, e.g. `sip_password` before credential encryption exists |\n"
   },
   "servers": [
     {
@@ -23,18 +23,18 @@
   "tags": [
     {
       "name": "Diagnostics",
-      "description": "What to call when calls are not arriving."
+      "description": "What to call when calls are not arriving: /v1/route and /v1/numbers."
     },
     {
       "name": "Tenants"
     },
     {
-      "name": "Plans",
-      "description": "What happens to a call once it is admitted."
+      "name": "Traffic configs",
+      "description": "Lines: a set of a trunk's numbers, a direction, a destination and a recording policy."
     },
     {
-      "name": "DIDs",
-      "description": "Numbers. Normalised to E.164 on write."
+      "name": "Numbers",
+      "description": "One number's configuration, across trunks and lines."
     },
     {
       "name": "Trunks",
@@ -360,12 +360,12 @@
         }
       }
     },
-    "/v1/plans": {
+    "/v1/traffic-configs": {
       "get": {
         "tags": [
-          "Plans"
+          "Traffic configs"
         ],
-        "summary": "List plans",
+        "summary": "List traffic configs",
         "parameters": [
           {
             "name": "tenant_id",
@@ -374,17 +374,25 @@
               "type": "string"
             },
             "description": "Platform keys may name any tenant. A tenant-scoped key always gets its own, whatever this says."
+          },
+          {
+            "name": "trunk_id",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Plans",
+            "description": "Traffic configs",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/Plan"
+                    "$ref": "#/components/schemas/TrafficConfig"
                   }
                 }
               }
@@ -414,15 +422,15 @@
       },
       "post": {
         "tags": [
-          "Plans"
+          "Traffic configs"
         ],
-        "summary": "Create a plan",
+        "summary": "Create a traffic config",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PlanCreate"
+                "$ref": "#/components/schemas/TrafficConfigCreate"
               }
             }
           }
@@ -433,13 +441,33 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Plan"
+                  "$ref": "#/components/schemas/TrafficConfig"
                 }
               }
             }
           },
           "400": {
-            "description": "Invalid, or destination=ai with no agent_identity",
+            "description": "Invalid: a malformed block, an unknown destination, reject on an outbound line",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The trunk does not exist or is not visible to this caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The numbers are outside the trunk, already claimed by another line in this direction, or the trunk belongs to another tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -471,19 +499,20 @@
         }
       }
     },
-    "/v1/plans/{id}": {
+    "/v1/traffic-configs/{id}": {
       "patch": {
         "tags": [
-          "Plans"
+          "Traffic configs"
         ],
-        "summary": "Update a plan",
+        "summary": "Update a traffic config",
         "parameters": [
           {
             "name": "id",
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "integer",
+              "format": "int64"
             }
           }
         ],
@@ -492,7 +521,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PlanPatch"
+                "$ref": "#/components/schemas/TrafficConfigPatch"
               }
             }
           }
@@ -503,13 +532,33 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Plan"
+                  "$ref": "#/components/schemas/TrafficConfig"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "404": {
             "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The new numbers conflict with the trunk or another line",
             "content": {
               "application/json": {
                 "schema": {
@@ -542,16 +591,17 @@
       },
       "delete": {
         "tags": [
-          "Plans"
+          "Traffic configs"
         ],
-        "summary": "Soft-delete a plan",
+        "summary": "Soft-delete a traffic config, and its handoff overrides",
         "parameters": [
           {
             "name": "id",
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "integer",
+              "format": "int64"
             }
           }
         ],
@@ -592,210 +642,41 @@
         }
       }
     },
-    "/v1/dids": {
+    "/v1/numbers/{e164}": {
       "get": {
         "tags": [
-          "DIDs"
+          "Numbers"
         ],
-        "summary": "List numbers",
+        "summary": "Which trunk carries a number, and which line handles it each way",
+        "description": "/v1/route answers \"would a call be admitted now\". This answers \"who does this number belong to and what is configured on it\", including the outbound side. A tenant-scoped key sees only its own lines, and gets 404 for a number that is neither on its trunk nor leased to it.",
         "parameters": [
           {
-            "name": "tenant_id",
-            "in": "query",
+            "name": "e164",
+            "in": "path",
+            "required": true,
             "schema": {
               "type": "string"
             },
-            "description": "Platform keys may name any tenant. A tenant-scoped key always gets its own, whatever this says."
+            "examples": {
+              "n": {
+                "value": "+2348000000123"
+              }
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Numbers",
+            "description": "The number",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/DID"
-                  }
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "No or unrecognised token",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Insufficient scope, or another tenant's resource",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          }
-        }
-      },
-      "post": {
-        "tags": [
-          "DIDs"
-        ],
-        "summary": "Provision a number",
-        "description": "The number is normalised to E.164 on write, so `0049 30 123-456` and `+4930123456` are one row and the unique index means what it says.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DIDCreate"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Created",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DID"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid number",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "No or unrecognised token",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Insufficient scope, or another tenant's resource",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/dids/{id}": {
-      "patch": {
-        "tags": [
-          "DIDs"
-        ],
-        "summary": "Update a number",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DIDPatch"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Updated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DID"
+                  "$ref": "#/components/schemas/NumberInfo"
                 }
               }
             }
           },
           "404": {
-            "description": "Not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "No or unrecognised token",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Insufficient scope, or another tenant's resource",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "tags": [
-          "DIDs"
-        ],
-        "summary": "Release a number",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Released"
-          },
-          "404": {
-            "description": "Not found",
+            "description": "No trunk carries it, or it is not this tenant's",
             "content": {
               "application/json": {
                 "schema": {
@@ -956,7 +837,7 @@
           "Trunks"
         ],
         "summary": "Update a trunk",
-        "description": "`type`, `carrier` and `sip_auth_method` are not patchable: changing what kind of trunk a row is, in place, while DIDs point at it, is a migration rather than an edit.",
+        "description": "`carrier` and `sip_auth_method` are not patchable: changing what kind of trunk a row is, in place, while lines sit on it, is a migration rather than an edit.",
         "parameters": [
           {
             "name": "id",
@@ -1052,7 +933,7 @@
             "description": "Deleted"
           },
           "409": {
-            "description": "DIDs still route by this trunk \u2014 repoint them first",
+            "description": "Traffic configs still sit on this trunk \u2014 delete or move them first",
             "content": {
               "application/json": {
                 "schema": {
@@ -1094,13 +975,13 @@
         }
       }
     },
-    "/v1/trunks/{id}/drift": {
+    "/v1/trunks/{id}/coverage": {
       "get": {
         "tags": [
-          "Diagnostics"
+          "Trunks"
         ],
-        "summary": "Does Twilio agree with us?",
-        "description": "Four pieces of configuration live in Twilio's console with nothing checking them, and every mismatch fails silently.\n\n| Check | If it is wrong |\n|---|---|\n| `origination_uri` | **No inbound call ever arrives**, and there is nothing to see on our side \u2014 the packet goes wherever Twilio was told |\n| `termination_acl` | Outbound calls refused with 403 |\n| `phone_numbers` | Numbers Twilio routes that we do not know are refused as unknown; numbers we have that Twilio does not are never called |\n| `signalling_cidrs` | Recorded but **not verifiable** \u2014 Twilio publishes these as documentation, not through the API |\n\n**Read only.** Nothing is written back to Twilio.\n\nAlways `200`, even when it finds drift: \"I checked and found problems\" and \"I could not check\" are different answers.",
+        "summary": "How a trunk's numbers are divided among lines, and which are uncovered",
+        "description": "A tenant may see coverage of its own trunks. The platform trunk's coverage lists every tenant's lines and which numbers are unleased, so it needs a platform key.",
         "parameters": [
           {
             "name": "id",
@@ -1114,37 +995,17 @@
         ],
         "responses": {
           "200": {
-            "description": "The comparison",
+            "description": "Coverage",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DriftReport"
+                  "$ref": "#/components/schemas/Coverage"
                 }
               }
             }
           },
-          "400": {
-            "description": "This trunk has no twilio_trunk_sid",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          },
-          "501": {
-            "description": "Twilio credentials are not configured",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          },
-          "502": {
-            "description": "Twilio could not be reached",
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -1460,7 +1321,7 @@
             }
           },
           "409": {
-            "description": "The from-DID has no trunk with a SIP host",
+            "description": "The outbound line's trunk has no sip_host",
             "content": {
               "application/json": {
                 "schema": {
@@ -1967,222 +1828,6 @@
           }
         }
       },
-      "Plan": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "examples": [
-              "p_main"
-            ]
-          },
-          "tenant_id": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "active",
-              "inactive"
-            ]
-          },
-          "destination": {
-            "type": "string",
-            "enum": [
-              "ai",
-              "handoff",
-              "reject"
-            ]
-          },
-          "recording": {
-            "type": "boolean"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "updated_at": {
-            "type": "string",
-            "format": "date-time"
-          }
-        }
-      },
-      "PlanCreate": {
-        "type": "object",
-        "required": [
-          "id",
-          "name",
-          "destination"
-        ],
-        "description": "The agent settings are FIELDS OF THE PLAN, not a separate resource: a plan routing to `ai` with no agent configured is a call refused pre-answer, so the two go in one request.",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "tenant_id": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "active",
-              "inactive"
-            ]
-          },
-          "destination": {
-            "type": "string",
-            "enum": [
-              "ai",
-              "handoff",
-              "reject"
-            ]
-          },
-          "recording": {
-            "type": "boolean",
-            "description": "Starts record_session before the bridge. Off by default."
-          },
-          "agent_identity": {
-            "type": "string",
-            "description": "REQUIRED when destination=ai, rejected otherwise."
-          },
-          "room_template": {
-            "type": "string",
-            "default": "{call_uuid}",
-            "description": "Placeholders: {call_uuid} {tenant_id} {plan_id} {did}"
-          }
-        }
-      },
-      "PlanPatch": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "active",
-              "inactive"
-            ]
-          },
-          "destination": {
-            "type": "string",
-            "enum": [
-              "ai",
-              "handoff",
-              "reject"
-            ]
-          },
-          "recording": {
-            "type": "boolean"
-          },
-          "agent_identity": {
-            "type": "string"
-          },
-          "room_template": {
-            "type": "string"
-          }
-        }
-      },
-      "DID": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "number": {
-            "type": "string",
-            "examples": [
-              "+4930123456"
-            ],
-            "description": "Stored normalised to E.164."
-          },
-          "tenant_id": {
-            "type": "string"
-          },
-          "plan_id": {
-            "type": "string"
-          },
-          "trunk_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "active",
-              "inactive"
-            ]
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "updated_at": {
-            "type": "string",
-            "format": "date-time"
-          }
-        }
-      },
-      "DIDCreate": {
-        "type": "object",
-        "required": [
-          "number"
-        ],
-        "properties": {
-          "number": {
-            "type": "string",
-            "examples": [
-              "+4930123456",
-              "0049 30 123-456"
-            ],
-            "description": "Normalised on write with the same function the call path uses, so every shape of a number is one row."
-          },
-          "tenant_id": {
-            "type": "string"
-          },
-          "plan_id": {
-            "type": "string"
-          },
-          "trunk_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "active",
-              "inactive"
-            ]
-          }
-        }
-      },
-      "DIDPatch": {
-        "type": "object",
-        "properties": {
-          "plan_id": {
-            "type": "string"
-          },
-          "trunk_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "active",
-              "inactive"
-            ]
-          }
-        }
-      },
       "Trunk": {
         "type": "object",
         "properties": {
@@ -2192,21 +1837,13 @@
           },
           "tenant_id": {
             "type": "string",
-            "description": "Absent means platform-wide: the shared carrier every tenant leaves by."
+            "description": "Absent means the platform trunk: ours, with its numbers leased to tenants line by line. Set means the client's own (BYOT)."
           },
           "slug": {
             "type": "string"
           },
           "name": {
             "type": "string"
-          },
-          "type": {
-            "type": "string",
-            "enum": [
-              "inbound",
-              "outbound",
-              "bi_directional"
-            ]
           },
           "carrier": {
             "type": "string"
@@ -2220,9 +1857,6 @@
               "active",
               "inactive"
             ]
-          },
-          "is_default": {
-            "type": "boolean"
           },
           "sip_host": {
             "type": "string"
@@ -2257,6 +1891,13 @@
               "type": "string"
             }
           },
+          "did_ranges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NumberRange"
+            },
+            "description": "The number inventory: every number a carrier can deliver on this trunk. A number can be on only one trunk \u2014 a request claiming numbers another trunk carries is refused with 409."
+          },
           "channel_size": {
             "type": [
               "integer",
@@ -2265,10 +1906,6 @@
           },
           "caller_id_format": {
             "type": "string"
-          },
-          "twilio_trunk_sid": {
-            "type": "string",
-            "description": "Links this row to Twilio, for drift detection."
           },
           "health_status": {
             "type": "string"
@@ -2289,7 +1926,6 @@
           "slug",
           "name",
           "carrier",
-          "type",
           "sip_auth_method"
         ],
         "properties": {
@@ -2302,14 +1938,6 @@
           "name": {
             "type": "string"
           },
-          "type": {
-            "type": "string",
-            "enum": [
-              "inbound",
-              "outbound",
-              "bi_directional"
-            ]
-          },
           "carrier": {
             "type": "string"
           },
@@ -2319,9 +1947,6 @@
               "active",
               "inactive"
             ]
-          },
-          "is_default": {
-            "type": "boolean"
           },
           "sip_host": {
             "type": "string"
@@ -2355,6 +1980,13 @@
               "type": "string"
             }
           },
+          "did_ranges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NumberRange"
+            },
+            "description": "The number inventory: every number a carrier can deliver on this trunk. A number can be on only one trunk \u2014 a request claiming numbers another trunk carries is refused with 409."
+          },
           "channel_size": {
             "type": [
               "integer",
@@ -2363,12 +1995,6 @@
           },
           "caller_id_format": {
             "type": "string"
-          },
-          "twilio_trunk_sid": {
-            "type": "string",
-            "examples": [
-              "TK32a3c49700594992af..."
-            ]
           }
         }
       },
@@ -2427,8 +2053,12 @@
           "clear_channel_size": {
             "type": "boolean"
           },
-          "twilio_trunk_sid": {
-            "type": "string"
+          "did_ranges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NumberRange"
+            },
+            "description": "REPLACES the inventory. Refused with 409 if it drops numbers a traffic config still uses."
           }
         }
       },
@@ -2441,6 +2071,14 @@
           },
           "tenant_id": {
             "type": "string"
+          },
+          "traffic_config_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Set: an override for that one line. Absent: part of the tenant's default list. A line with any enabled override uses only its overrides."
           },
           "name": {
             "type": "string"
@@ -2488,6 +2126,14 @@
           "tenant_id": {
             "type": "string"
           },
+          "traffic_config_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Set: an override for that one line. Absent: part of the tenant's default list. A line with any enabled override uses only its overrides."
+          },
           "name": {
             "type": "string"
           },
@@ -2497,7 +2143,7 @@
               "sip_uri",
               "e164"
             ],
-            "description": "An e164 target leaves by the tenant's default trunk; a sip_uri carries its own host."
+            "description": "An e164 target is a new outbound call placed over the CALL'S trunk \u2014 the one its line's numbers live on. A sip_uri carries its own host."
           },
           "destination": {
             "type": "string"
@@ -2532,6 +2178,15 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "traffic_config_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Move onto that line's override list."
+          },
+          "clear_traffic_config": {
+            "type": "boolean",
+            "description": "Move back to the tenant's default list."
           }
         }
       },
@@ -2549,11 +2204,10 @@
             "enum": [
               "ok",
               "unknown_did",
-              "did_inactive",
-              "no_plan",
-              "plan_inactive",
+              "no_traffic_config",
+              "traffic_config_inactive",
               "tenant_suspended",
-              "plan_rejects",
+              "traffic_config_rejects",
               "over_capacity",
               "lookup_failed"
             ]
@@ -2561,14 +2215,22 @@
           "tenant_id": {
             "type": "string"
           },
-          "plan_id": {
-            "type": "string"
+          "traffic_config_id": {
+            "type": "integer",
+            "format": "int64"
           },
           "destination": {
             "type": "string"
           },
-          "recording": {
-            "type": "boolean"
+          "recording_mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "ai_only",
+              "full"
+            ],
+            "default": "none",
+            "description": "none: do not record. ai_only: record the AI conversation and stop when a human takes over. full: record the whole call, handoff included. Snapshotted when a call starts; editing it does not affect calls in progress."
           },
           "trunk_id": {
             "type": "integer",
@@ -2580,46 +2242,6 @@
           },
           "note": {
             "type": "string"
-          }
-        }
-      },
-      "DriftReport": {
-        "type": "object",
-        "properties": {
-          "trunk_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "twilio_trunk_sid": {
-            "type": "string"
-          },
-          "ok": {
-            "type": "boolean"
-          },
-          "checks": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "name": {
-                  "type": "string",
-                  "enum": [
-                    "origination_uri",
-                    "termination_acl",
-                    "phone_numbers",
-                    "signalling_cidrs"
-                  ]
-                },
-                "ok": {
-                  "type": "boolean"
-                },
-                "detail": {
-                  "type": "string"
-                },
-                "expected": {},
-                "actual": {}
-              }
-            }
           }
         }
       },
@@ -2636,8 +2258,10 @@
           "tenant_id": {
             "type": "string"
           },
-          "plan_id": {
-            "type": "string"
+          "traffic_config_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The outbound line the from number belongs to."
           },
           "from_did": {
             "type": "string"
@@ -2700,17 +2324,13 @@
             "examples": [
               "+4930123456"
             ],
-            "description": "MUST be an active DID this tenant owns. One lookup settles three things: authorisation, the caller ID presented, and the trunk the call leaves by."
+            "description": "MUST be inside an ACTIVE OUTBOUND traffic config belonging to this tenant. That one lookup settles authorisation, the caller ID presented, the trunk the call leaves by, what the answered customer is connected to, and the recording policy."
           },
           "to": {
             "type": "string",
             "examples": [
               "+2348012345678"
             ]
-          },
-          "plan_id": {
-            "type": "string",
-            "description": "What to do once the customer answers. Defaults to the AI leg."
           }
         }
       },
@@ -2723,8 +2343,13 @@
           "tenant_id": {
             "type": "string"
           },
-          "plan_id": {
-            "type": "string"
+          "traffic_config_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
           },
           "direction": {
             "type": "string",
@@ -2753,6 +2378,15 @@
           },
           "livekit_room": {
             "type": "string"
+          },
+          "recording_mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "ai_only",
+              "full"
+            ],
+            "description": "The policy the call runs under, snapshotted when it started."
           },
           "started_at": {
             "type": "string",
@@ -2796,11 +2430,25 @@
           "callee": {
             "type": "string"
           },
-          "plan_id": {
-            "type": "string"
+          "traffic_config_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
           },
           "livekit_room": {
             "type": "string"
+          },
+          "recording_mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "ai_only",
+              "full"
+            ],
+            "description": "The policy the call runs under, snapshotted when it started."
           },
           "invite_at": {
             "type": [
@@ -2958,6 +2606,328 @@
               "null"
             ],
             "format": "date-time"
+          }
+        }
+      },
+      "NumberRange": {
+        "type": "object",
+        "required": [
+          "from",
+          "to"
+        ],
+        "description": "An inclusive block of E.164 numbers. Both ends must have the same number of digits. A single number is a block whose from and to are equal. Adjacent and overlapping blocks are merged on write and come back merged.",
+        "properties": {
+          "from": {
+            "type": "string",
+            "examples": [
+              "+2348000000100"
+            ]
+          },
+          "to": {
+            "type": "string",
+            "examples": [
+              "+2348000000199"
+            ]
+          }
+        }
+      },
+      "TrafficConfig": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "inbound",
+              "outbound"
+            ]
+          },
+          "did_ranges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NumberRange"
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "destination": {
+            "type": "string",
+            "enum": [
+              "ai",
+              "handoff",
+              "reject"
+            ],
+            "description": "Inbound: what happens when the number rings. Outbound: what the answered customer is connected to \u2014 reject is refused for an outbound line."
+          },
+          "recording_mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "ai_only",
+              "full"
+            ],
+            "default": "none",
+            "description": "none: do not record. ai_only: record the AI conversation and stop when a human takes over. full: record the whole call, handoff included. Snapshotted when a call starts; editing it does not affect calls in progress."
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TrafficConfigCreate": {
+        "type": "object",
+        "required": [
+          "trunk_id",
+          "name",
+          "direction",
+          "did_ranges",
+          "destination"
+        ],
+        "description": "The numbers must lie within the trunk's did_ranges, and no other line may claim any of them in the same direction \u2014 both refused with 409. On a client's own trunk the line belongs to that client; on the platform trunk a platform key must say which tenant the numbers are leased to.",
+        "properties": {
+          "tenant_id": {
+            "type": "string",
+            "description": "Required for a line on the platform trunk when using a platform key."
+          },
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "inbound",
+              "outbound"
+            ]
+          },
+          "did_ranges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NumberRange"
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ],
+            "default": "active"
+          },
+          "destination": {
+            "type": "string",
+            "enum": [
+              "ai",
+              "handoff",
+              "reject"
+            ],
+            "description": "Inbound: what happens when the number rings. Outbound: what the answered customer is connected to \u2014 reject is refused for an outbound line."
+          },
+          "recording_mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "ai_only",
+              "full"
+            ],
+            "default": "none",
+            "description": "none: do not record. ai_only: record the AI conversation and stop when a human takes over. full: record the whole call, handoff included. Snapshotted when a call starts; editing it does not affect calls in progress."
+          },
+          "metadata": {
+            "type": "object"
+          }
+        }
+      },
+      "TrafficConfigPatch": {
+        "type": "object",
+        "description": "trunk_id and direction cannot change: moving a line is a different line. Delete and recreate.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "destination": {
+            "type": "string",
+            "enum": [
+              "ai",
+              "handoff",
+              "reject"
+            ],
+            "description": "Inbound: what happens when the number rings. Outbound: what the answered customer is connected to \u2014 reject is refused for an outbound line."
+          },
+          "recording_mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "ai_only",
+              "full"
+            ],
+            "default": "none",
+            "description": "none: do not record. ai_only: record the AI conversation and stop when a human takes over. full: record the whole call, handoff included. Snapshotted when a call starts; editing it does not affect calls in progress."
+          },
+          "did_ranges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NumberRange"
+            },
+            "description": "Replaces the line's numbers. Cannot be emptied."
+          },
+          "metadata": {
+            "type": "object"
+          }
+        }
+      },
+      "NumberInfo": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string"
+          },
+          "trunk": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "slug": {
+                "type": "string"
+              },
+              "tenant_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "platform": {
+                "type": "boolean",
+                "description": "True for the platform trunk, whose numbers are leased line by line."
+              }
+            }
+          },
+          "inbound": {
+            "$ref": "#/components/schemas/TrafficConfig"
+          },
+          "outbound": {
+            "$ref": "#/components/schemas/TrafficConfig"
+          }
+        }
+      },
+      "Coverage": {
+        "type": "object",
+        "properties": {
+          "trunk_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "did_ranges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NumberRange"
+            }
+          },
+          "inbound": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "traffic_config_id": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "tenant_id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "did_ranges": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/NumberRange"
+                  }
+                }
+              }
+            }
+          },
+          "outbound": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "traffic_config_id": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "tenant_id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "did_ranges": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/NumberRange"
+                  }
+                }
+              }
+            }
+          },
+          "uncovered_inbound": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NumberRange"
+            },
+            "description": "Numbers that ring and are refused as unconfigured (503)."
+          },
+          "uncovered_outbound": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NumberRange"
+            },
+            "description": "Numbers nobody can dial out from."
           }
         }
       }

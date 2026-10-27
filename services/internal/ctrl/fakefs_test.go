@@ -37,6 +37,10 @@ type channelData struct {
 	caller      string
 	node        string
 	sipCallID   string
+
+	// vars are extra channel variables, sent as variable_<name> — what an
+	// originate sets on the channel it creates.
+	vars map[string]string
 }
 
 func defaultChannel() channelData {
@@ -177,6 +181,9 @@ func (f *fakeFS) sendChannelData(ch channelData) {
 	fmt.Fprintf(&b, "Call-Direction: inbound\r\n")
 	fmt.Fprintf(&b, "variable_intron_node: %s\r\n", ch.node)
 	fmt.Fprintf(&b, "variable_sip_call_id: %s\r\n", ch.sipCallID)
+	for k, v := range ch.vars {
+		fmt.Fprintf(&b, "variable_%s: %s\r\n", k, v)
+	}
 	b.WriteString("\r\n")
 
 	f.write(b.String())

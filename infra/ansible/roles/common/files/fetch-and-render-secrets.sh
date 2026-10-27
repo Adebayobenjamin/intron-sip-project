@@ -30,7 +30,7 @@ secret_id="${1:?usage: $0 <secret-id> <config-dir> [owner[:group]]}"
 config_dir="${2:?usage: $0 <secret-id> <config-dir> [owner[:group]]}"
 owner="${3:-}"
 
-aws_region="${AWS_REGION:-eu-central-1}"
+aws_region="${AWS_REGION:-eu-west-1}"
 
 command -v aws      >/dev/null || { echo "fetch-and-render-secrets: aws cli not installed" >&2; exit 1; }
 command -v jq       >/dev/null || { echo "fetch-and-render-secrets: jq not installed" >&2; exit 1; }

@@ -174,11 +174,11 @@ type ChannelData struct {
 	// labelled the way the platform means it.
 	IntronDirection string
 
-	// Tenant and Plan are set by the originate for an outbound call. For an
-	// inbound one they are empty — Kamailio no longer appends them, and the
-	// controller resolves the DID itself.
-	Tenant string
-	Plan   string
+	// Tenant and TrafficConfig are set by the originate for an outbound call.
+	// For an inbound one they are empty — the controller resolves the dialled
+	// number itself. TrafficConfig is the line's id, as text.
+	Tenant        string
+	TrafficConfig string
 }
 
 // ParseChannelData reads the connect reply.
@@ -201,7 +201,7 @@ func ParseChannelData(m *Message) ChannelData {
 		Direction:       m.GetAny("Call-Direction", "Caller-Direction"),
 		IntronDirection: m.Variable("intron_direction"),
 		Tenant:          m.Variable("intron_tenant"),
-		Plan:            m.Variable("intron_plan"),
+		TrafficConfig:   m.Variable("intron_traffic_config"),
 	}
 }
 

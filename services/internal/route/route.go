@@ -49,13 +49,9 @@ const (
 	EgressLiveKit = "livekit"
 )
 
-// ErrNoAgentConfig means a plan routes to the AI leg but nobody has configured
-// the agent for it.
-var ErrNoAgentConfig = errors.New("route: plan has no agent config")
-
-// ErrNoHandoffTarget means a plan routes to a human and the tenant has none
-// enabled.
-var ErrNoHandoffTarget = errors.New("route: tenant has no enabled handoff target")
+// ErrNoHandoffTarget means a line routes to a human and neither it nor the
+// tenant has a target enabled.
+var ErrNoHandoffTarget = errors.New("route: no enabled handoff target")
 
 // Kinds of handoff target.
 const (
@@ -69,31 +65,28 @@ type HandoffTarget struct {
 	Kind        string
 	Destination string
 
-	// TrunkHost is the tenant's default trunk, used for an E.164 target. A
-	// SIP URI carries its own host and ignores this.
+	// TrunkHost and TrunkPort are the CALL'S trunk — the carrier its line's
+	// numbers live on — used for an E.164 target, which is a new outbound call
+	// placed through that carrier. A SIP URI carries its own host and ignores
+	// both.
 	TrunkHost string
+	TrunkPort int
 }
 
-// Plan is the subset of an inbound plan an outbound call needs: it names what
-// to do once the customer answers.
-type Plan struct {
-	ID          string
-	TenantID    string
-	Destination string
-	Recording   bool
-}
-
-// AgentConfig is what the AI leg is handed.
-type AgentConfig struct {
-	RoomTemplate  string
-	AgentIdentity string
+// Line is the subset of a traffic config an answered outbound call needs: what
+// to connect the customer to, and under which recording policy.
+type Line struct {
+	ID            int64
+	TenantID      string
+	TrunkID       int64
+	Destination   string
+	RecordingMode string
 }
 
 // Params are the facts a dial string is built from.
 type Params struct {
 	CallUUID string
 	TenantID string
-	PlanID   string
 
 	// CallerID is the number the outgoing leg presents. For the B-leg of an
 	// inbound call this is the original caller, so the far end sees who rang
@@ -108,17 +101,21 @@ type Params struct {
 // LiveKit builds the dial string for the AI leg.
 //
 // The Request-URI host is a placeholder: Kamailio's dispatcher set 2 holds
-// livekit-sip's real address and overwrites the destination. That indirection
-// is deliberate — LiveKit's location is one of exactly two values that change
-// when the accounts are peered, and both live in the inventory rather than
-// here.
+// livekit-sip's real address and overwrites the destination, so where LiveKit
+// lives is a fact about the inventory rather than about this service.
 //
-// The room name goes in the USER part, which is what livekit-sip matches a
-// dispatch rule against.
-func LiveKit(p Params, cfg AgentConfig) (string, error) {
-	room := RoomName(cfg.RoomTemplate, p)
+// WHICH AGENT ANSWERS IS NOT DECIDED HERE. Every call reaches the same agent,
+// summoned by name from LiveKit's dispatch rule, so there is nothing per line
+// to pass.
+//
+// The room name is the call UUID, in the Request-URI's user part. It is unique
+// and needs no coordination — but note that it is what this service RECORDS as
+// the room, not necessarily what LiveKit creates: a dispatch rule of the
+// `individual` kind names the room from its own prefix and the caller instead.
+func LiveKit(p Params) (string, error) {
+	room := p.CallUUID
 	if room == "" {
-		return "", fmt.Errorf("route: empty room name from template %q", cfg.RoomTemplate)
+		return "", fmt.Errorf("route: the AI leg needs a call uuid to name its room")
 	}
 
 	vars := []string{
@@ -194,13 +191,21 @@ func handoffLeg(p Params, t HandoffTarget) (string, error) {
 
 	case KindE164:
 		if t.TrunkHost == "" {
-			// An E.164 target needs a trunk to leave by, and the tenant has no
-			// default. Dialling it with no host would produce a Request-URI
-			// pointing at Kamailio itself, which loops.
-			return "", fmt.Errorf("route: handoff target %d is E.164 but the tenant has no default trunk", t.ID)
+			// An E.164 target is a new call through a carrier, and this call
+			// has no trunk with a host to place it through. Dialling it with
+			// no host would produce a Request-URI pointing at Kamailio itself,
+			// which loops.
+			return "", fmt.Errorf("route: handoff target %d is E.164 but the call has no trunk with a SIP host", t.ID)
 		}
-		return dialString(vars,
-			"sofia/internal/sip:"+t.Destination+"@"+t.TrunkHost), nil
+
+		// The carrier's port goes in the Request-URI, the same as for an
+		// originate: Kamailio relays to what the Request-URI names, so a
+		// carrier on another port is only reached if it is written here.
+		host := t.TrunkHost
+		if t.TrunkPort != 0 && t.TrunkPort != 5060 {
+			host = fmt.Sprintf("%s:%d", t.TrunkHost, t.TrunkPort)
+		}
+		return dialString(vars, "sofia/internal/sip:"+t.Destination+"@"+host), nil
 
 	default:
 		return "", fmt.Errorf("route: handoff target %d has unknown kind %q", t.ID, t.Kind)
@@ -230,24 +235,6 @@ func sanitiseVar(v string) string {
 		"\r", "",
 		"\n", "",
 	).Replace(v)
-}
-
-// RoomName renders a room template.
-//
-// Defaults to the channel UUID, which is unique, already exists, and needs no
-// coordination with anything. A template is only worth setting when the
-// LiveKit side wants to recognise something in the name.
-func RoomName(template string, p Params) string {
-	if strings.TrimSpace(template) == "" {
-		return p.CallUUID
-	}
-
-	return strings.NewReplacer(
-		"{call_uuid}", p.CallUUID,
-		"{tenant_id}", p.TenantID,
-		"{plan_id}", p.PlanID,
-		"{did}", p.DID,
-	).Replace(template)
 }
 
 // RecordingPath is the filename a call's recording is written to.

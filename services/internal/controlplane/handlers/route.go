@@ -35,14 +35,14 @@ type Route struct {
 }
 
 type routeResponse struct {
-	Number      string `json:"number"`
-	Admitted    bool   `json:"admitted"`
-	Reason      string `json:"reason"`
-	TenantID    string `json:"tenant_id,omitempty"`
-	PlanID      string `json:"plan_id,omitempty"`
-	Destination string `json:"destination,omitempty"`
-	Recording   bool   `json:"recording"`
-	TrunkID     int64  `json:"trunk_id,omitempty"`
+	Number          string `json:"number"`
+	Admitted        bool   `json:"admitted"`
+	Reason          string `json:"reason"`
+	TenantID        string `json:"tenant_id,omitempty"`
+	TrafficConfigID int64  `json:"traffic_config_id,omitempty"`
+	Destination     string `json:"destination,omitempty"`
+	RecordingMode   string `json:"recording_mode,omitempty"`
+	TrunkID         int64  `json:"trunk_id,omitempty"`
 
 	// Stale reports that the answer came from an expired cache entry because
 	// the database could not be reached.
@@ -79,15 +79,15 @@ func (h Route) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := routeResponse{
-		Number:      number,
-		Admitted:    v.Admitted,
-		Reason:      string(v.Reason),
-		TenantID:    v.TenantID,
-		PlanID:      v.PlanID,
-		Destination: string(v.Destination),
-		Recording:   v.Recording,
-		TrunkID:     v.TrunkID,
-		Stale:       v.Stale,
+		Number:          number,
+		Admitted:        v.Admitted,
+		Reason:          string(v.Reason),
+		TenantID:        v.TenantID,
+		TrafficConfigID: v.TrafficConfigID,
+		Destination:     string(v.Destination),
+		RecordingMode:   string(v.RecordingMode),
+		TrunkID:         v.TrunkID,
+		Stale:           v.Stale,
 	}
 
 	if v.Stale {

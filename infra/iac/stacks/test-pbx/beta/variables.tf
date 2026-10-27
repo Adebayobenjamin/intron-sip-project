@@ -1,13 +1,13 @@
 variable "aws_region" {
   type        = string
-  description = "See stacks/network/beta/variables.tf for why eu-central-1."
-  default     = "eu-central-1"
+  description = "See stacks/network/beta/variables.tf for why eu-west-1."
+  default     = "eu-west-1"
 }
 
 variable "state_bucket" {
   type        = string
   description = "State bucket, created by the tfstate stack. Read here to configure the remote_state lookups for network and sip-core."
-  default     = "intron-sip-tfstate-eu-central-1"
+  default     = "intron-sip-tfstate-eu-west-1"
 }
 
 variable "aws_profile" {
@@ -20,7 +20,7 @@ variable "aws_profile" {
     `make plan` does. Also passed to terraform_remote_state, which configures
     its own backend and inherits nothing from the provider block.
   DESC
-  default     = "klarity_aws"
+  default     = "intron_aws"
 }
 
 variable "operator_cidr" {

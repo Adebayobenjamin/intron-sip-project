@@ -37,12 +37,14 @@ func transferredChannel() channelData {
 
 func liveCall(uuid string) *fakeLive {
 	return &fakeLive{call: calls.Live{
-		CallUUID: uuid,
-		TenantID: "t_test",
-		PlanID:   "p_ai",
-		DID:      "+13343453663",
-		Caller:   "+2349030622835",
-		State:    "bridged",
+		CallUUID:        uuid,
+		TenantID:        "t_test",
+		TrafficConfigID: 21,
+		TrunkID:         9,
+		DID:             "+13343453663",
+		Caller:          "+2349030622835",
+		State:           "bridged",
+		RecordingMode:   "ai_only",
 	}}
 }
 
@@ -205,5 +207,100 @@ func TestHandoff_FailedHandoffIsNotRecordedAsTransferred(t *testing.T) {
 	if rec.Outcome != "unroutable" {
 		t.Errorf("Outcome = %q, want unroutable — the reason the handoff could "+
 			"not happen is the one field anyone would ask about", rec.Outcome)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Recording across the transfer
+// ---------------------------------------------------------------------------
+
+// THE ai_only BUG. The recording runs on the caller's channel, and a REFER
+// transfers that same channel — so a recording started for the AI keeps
+// running into the human conversation unless the transferred leg stops it.
+// Not starting a second one, which is all the old code did, is not enough.
+func TestHandoff_TransferredLegStopsAnAIOnlyRecording(t *testing.T) {
+	ch := transferredChannel()
+
+	addr := startListenerLive(t, &stubResolver{}, &fakeLedger{}, handoffRoutes(), &fakeProbe{}, liveCall(ch.uuid))
+	fs := dialFakeFS(t, addr, ch)
+	cmds := fs.serveCallThenHangup(ch.uuid, "NORMAL_CLEARING", "recv_bye")
+	assertBridged(t, cmds)
+
+	stop := commandIndex(cmds, "execute-app-name: stop_record_session")
+	bridge := commandIndex(cmds, "execute-app-name: bridge")
+	if stop < 0 {
+		t.Fatalf("the AI-leg recording was not stopped before the human joined:\n%s",
+			strings.Join(cmds, "\n"))
+	}
+	if stop > bridge {
+		t.Error("the recording was stopped after the human was bridged; the start of the conversation is recorded")
+	}
+
+	// The same file the AI leg wrote, derived the same way.
+	want := "/mnt/recordings/t_test__" + ch.uuid + ".wav"
+	if cmd, _ := findCommand(cmds, "stop_record_session"); !strings.Contains(cmd, want) {
+		t.Errorf("stopped %q, want the path %q", cmd, want)
+	}
+
+	if i := commandIndex(cmds, "execute-app-name: record_session"); i >= 0 {
+		t.Error("the transferred leg started a new recording")
+	}
+}
+
+// full must carry on through the handoff: no stop, and no second recording
+// writing over the first.
+func TestHandoff_TransferredLegLeavesAFullRecordingRunning(t *testing.T) {
+	ch := transferredChannel()
+	live := liveCall(ch.uuid)
+	live.call.RecordingMode = "full"
+
+	addr := startListenerLive(t, &stubResolver{}, &fakeLedger{}, handoffRoutes(), &fakeProbe{}, live)
+	fs := dialFakeFS(t, addr, ch)
+	cmds := fs.serveCallThenHangup(ch.uuid, "NORMAL_CLEARING", "recv_bye")
+	assertBridged(t, cmds)
+
+	joined := strings.Join(cmds, "\n")
+	if strings.Contains(joined, "stop_record_session") {
+		t.Error("a full recording was stopped at the handoff")
+	}
+	if strings.Contains(joined, "execute-app-name: record_session") {
+		t.Error("a second recording was started over the one already running")
+	}
+}
+
+// The policy comes from the snapshot on the live row, not the line: an edit
+// mid-call must not change what happens to a conversation already in progress.
+// The resolver is never consulted, so the only place the mode can come from is
+// the row.
+func TestHandoff_RecordingPolicyComesFromTheSnapshot(t *testing.T) {
+	ch := transferredChannel()
+	live := liveCall(ch.uuid)
+	live.call.RecordingMode = "none"
+
+	addr := startListenerLive(t, &stubResolver{}, &fakeLedger{}, handoffRoutes(), &fakeProbe{}, live)
+	fs := dialFakeFS(t, addr, ch)
+	cmds := fs.serveCallThenHangup(ch.uuid, "NORMAL_CLEARING", "recv_bye")
+	assertBridged(t, cmds)
+
+	if strings.Contains(strings.Join(cmds, "\n"), "record_session") {
+		t.Error("recording touched on a call whose snapshot says none")
+	}
+}
+
+// The transferred leg dials out over the trunk the original call claimed —
+// for a tenant on the platform trunk, the only trunk there is.
+func TestHandoff_TransferredLegLeavesByTheCallsTrunk(t *testing.T) {
+	ch := transferredChannel()
+	routes := handoffRoutes()
+
+	addr := startListenerLive(t, &stubResolver{}, &fakeLedger{}, routes, &fakeProbe{}, liveCall(ch.uuid))
+	fs := dialFakeFS(t, addr, ch)
+	cmds := fs.serveCallThenHangup(ch.uuid, "NORMAL_CLEARING", "recv_bye")
+	assertBridged(t, cmds)
+
+	q := routes.handoffQueries()
+	want := handoffQuery{tenant: "t_test", trafficConfigID: 21, trunkID: 9}
+	if len(q) != 1 || q[0] != want {
+		t.Errorf("asked for %+v, want [%+v]", q, want)
 	}
 }

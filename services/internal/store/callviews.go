@@ -11,10 +11,7 @@ import (
 // LiveCalls returns calls in progress.
 func (p *Pool) LiveCalls(ctx context.Context, tenantID string) ([]calls.Live, error) {
 	rows, err := p.Query(ctx, `
-		SELECT call_uuid, tenant_id, COALESCE(plan_id, ''), direction,
-		       COALESCE(did, ''), COALESCE(caller, ''), state,
-		       COALESCE(node, ''), COALESCE(livekit_room, ''),
-		       started_at, answered_at, heartbeat_at
+		SELECT `+liveColumns+`
 		  FROM calls
 		 WHERE ($1::text IS NULL OR tenant_id = $1)
 		 ORDER BY started_at`, nullStringArg(tenantID))
@@ -26,9 +23,7 @@ func (p *Pool) LiveCalls(ctx context.Context, tenantID string) ([]calls.Live, er
 	out := []calls.Live{}
 	for rows.Next() {
 		var c calls.Live
-		if err := rows.Scan(&c.CallUUID, &c.TenantID, &c.PlanID, &c.Direction,
-			&c.DID, &c.Caller, &c.State, &c.Node, &c.LiveKitRoom,
-			&c.StartedAt, &c.AnsweredAt, &c.HeartbeatAt); err != nil {
+		if err := scanLive(rows, &c); err != nil {
 			return nil, fmt.Errorf("store: scanning live call: %w", err)
 		}
 		out = append(out, c)
@@ -47,7 +42,8 @@ func (p *Pool) CallHistory(ctx context.Context, tenantID string, limit int, befo
 	rows, err := p.Query(ctx, `
 		SELECT call_uuid, COALESCE(sip_call_id, ''), tenant_id, direction,
 		       COALESCE(did, ''), COALESCE(caller, ''), COALESCE(callee, ''),
-		       COALESCE(plan_id, ''), COALESCE(livekit_room, ''),
+		       COALESCE(traffic_config_id, 0), COALESCE(trunk_id, 0),
+		       COALESCE(livekit_room, ''), COALESCE(recording_mode, ''),
 		       invite_at, answer_at, end_at,
 		       COALESCE(talk_seconds, 0), COALESCE(sip_code, 0),
 		       COALESCE(hangup_cause, ''), COALESCE(hangup_by, ''),
@@ -67,7 +63,8 @@ func (p *Pool) CallHistory(ctx context.Context, tenantID string, limit int, befo
 		var c calls.Historic
 		var code int16
 		if err := rows.Scan(&c.CallUUID, &c.SIPCallID, &c.TenantID, &c.Direction,
-			&c.DID, &c.Caller, &c.Callee, &c.PlanID, &c.LiveKitRoom,
+			&c.DID, &c.Caller, &c.Callee, &c.TrafficConfigID, &c.TrunkID,
+			&c.LiveKitRoom, &c.RecordingMode,
 			&c.InviteAt, &c.AnswerAt, &c.EndAt,
 			&c.TalkSeconds, &code, &c.HangupCause, &c.HangupBy,
 			&c.Outcome, &c.Recording); err != nil {

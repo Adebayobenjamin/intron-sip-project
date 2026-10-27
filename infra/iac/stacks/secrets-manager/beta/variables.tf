@@ -1,7 +1,7 @@
 variable "aws_region" {
   type        = string
   description = "Region. Must match the other stacks — a Secrets Manager container is regional and a cross-region GetSecretValue just fails."
-  default     = "eu-central-1"
+  default     = "eu-west-1"
 }
 
 variable "aws_profile" {
@@ -31,5 +31,5 @@ variable "aws_profile" {
     but means any bare `aws` CLI call needs AWS_REGION set. The Makefile
     exports it.
   DESC
-  default     = "klarity_aws"
+  default     = "intron_aws"
 }
